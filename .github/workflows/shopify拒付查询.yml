@@ -22,6 +22,12 @@ jobs:
         run: |
           pip install requests
 
+      - name: 从 Secrets 生成 stores.json 配置文件
+        env:
+          STORES_JSON_CONTENT: ${{ secrets.STORES_JSON }}
+        run: |
+          echo "$STORES_JSON_CONTENT" > stores.json
+
       - name: 执行拒付数据同步
         run: |
           python main.py
