@@ -1,0 +1,27 @@
+name: Shopify Dispute Sync
+
+on:
+  schedule:
+    # 每天 UTC 时间 0点和12点自动运行（对应北京时间 8点 和 20点）
+    - cron: '0 0,12 * * *'
+  workflow_dispatch: # 开启手动触发按钮
+
+jobs:
+  run-sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 拉取仓库代码
+        uses: actions/checkout@v4
+
+      - name: 配置 Python 环境
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+
+      - name: 安装网络依赖库
+        run: |
+          pip install requests
+
+      - name: 执行拒付数据同步
+        run: |
+          python main.py
