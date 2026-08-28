@@ -162,7 +162,9 @@ def load_token_cache():
 def save_token_cache(cache):
     with FILE_LOCK:
         try:
-            os.makedirs(os.path.dirname(TOKEN_CACHE_FILE), exist_ok=True)
+            dir_name = os.path.dirname(TOKEN_CACHE_FILE)
+            if dir_name:  # 只有当包含子目录时才创建文件夹
+                os.makedirs(dir_name, exist_ok=True)
             with open(TOKEN_CACHE_FILE, "w", encoding="utf-8") as f:
                 json.dump(cache, f, ensure_ascii=False, indent=2)
         except Exception as e:
