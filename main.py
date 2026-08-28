@@ -222,7 +222,8 @@ def get_order_details(session, shop_domain, access_token, order_id, evidence_due
             # 智能更正与归并标签（仅影响订单标签）
             new_tags_list = process_order_tags(tags_list, tag_date_str, target_reason_cn)
             
-            if new_tags_list != tags_list:
+            # 使用 set 对比，避免因为列表标签顺序不同而触发不必要的 API 更新
+            if set(new_tags_list) != set(tags_list):
                 new_tags_str = ", ".join(new_tags_list)
                 update_url = f"https://{shop_domain}/admin/api/{API_VERSION}/orders/{order_id}.json"
                 update_headers = {"X-Shopify-Access-Token": access_token, "Content-Type": "application/json"}
@@ -231,7 +232,7 @@ def get_order_details(session, shop_domain, access_token, order_id, evidence_due
                 update_res = safe_request(session, "PUT", update_url, headers=update_headers, json=update_payload, timeout=15)
                 if update_res and update_res.status_code == 200:
                     tags_list = new_tags_list
-                    print(f"[{shop_domain}] 订单 {order_name} 标签已覆盖更新为: {new_tags_str}")
+                    print(f"[{shop_domain}] 订单 {order_name} 标签已更正更新为: {new_tags_str}")
 
             formatted_tags = "\n".join(tags_list)
             
@@ -416,8 +417,8 @@ def fetch_disputes_for_shop(store, token_cache):
     
     return parsed_disputes, sync_status, error_logs
 
-# ==================== 分批推送 GAS 防超时引擎 ====================
-def post_to_gas(session, action, item_key, item_list, batch_size=40):
+# ==================== 分批推送 GAS 防超时引擎（强力抗锁增强版） ====================
+def post_to_gas(session, action, item_key, item_list, batch_size=30, max_retries=6):
     if not item_list:
         return
         
@@ -427,22 +428,32 @@ def post_to_gas(session, action, item_key, item_list, batch_size=40):
     for i in range(0, total, batch_size):
         chunk = item_list[i:i + batch_size]
         payload = {"action": action, item_key: chunk}
+        success = False
         
-        for attempt in range(1, 4):
+        for attempt in range(1, max_retries + 1):
             res = safe_request(session, "POST", GAS_WEBHOOK_URL, json=payload, headers=headers, timeout=60)
             if res and res.status_code == 200:
                 try:
                     res_json = res.json()
                     if res_json.get("status") == "error" and "Lock timeout" in res_json.get("message", ""):
-                        print(f"[{action}] GAS 服务繁忙 (Lock timeout)，等待 3 秒后重试 (第 {attempt} 次)...")
-                        time.sleep(3)
+                        wait = 3 * (2 ** (attempt - 1)) # 指数退避：3s, 6s, 12s, 24s...
+                        print(f"[{action}] GAS 服务繁忙 (Lock timeout)，等待 {wait} 秒后重试 (第 {attempt}/{max_retries} 次)...")
+                        time.sleep(wait)
                         continue
                 except Exception:
                     pass
                 print(f"[{action}] 批次 ({i+1}-{min(i+batch_size, total)}/{total}) 推送成功: {res.text}")
+                success = True
                 break
             else:
-                time.sleep(2)
+                wait = 3 * attempt
+                print(f"[{action}] 推送异常 (Status: {res.status_code if res else 'None'})，等待 {wait} 秒后重试 (第 {attempt}/{max_retries} 次)...")
+                time.sleep(wait)
+                
+        if not success:
+            print(f"❌ [{action}] 批次 ({i+1}-{min(i+batch_size, total)}/{total}) 经过 {max_retries} 次重试后仍然失败，请检查 GAS 后端限制！")
+            
+        time.sleep(1) # 批次间加入 1 秒缓冲，极大降低 GAS 并发锁冲突
 
 # ==================== 主流程控制 ====================
 def main():
@@ -474,7 +485,7 @@ def main():
     session = get_session()
     
     if all_disputes:
-        post_to_gas(session, "SYNC_DISPUTES", "disputes", all_disputes, batch_size=40)
+        post_to_gas(session, "SYNC_DISPUTES", "disputes", all_disputes, batch_size=30)
         
     if all_sync_statuses:
         post_to_gas(session, "UPDATE_SYNC_STATUS", "sync_status", all_sync_statuses, batch_size=50)
