@@ -13,20 +13,15 @@ TOKEN_CACHE_FILE = "token_cache.json"
 
 # WebApp 部署地址
 GAS_WEBHOOK_URL = "https://script.google.com/macros/s/AKfycbz5lkaskmNJRA_X0iL_QQyRabeLzmnWmtuTETu3TrUEew7UOXzSd-ccas2yK0h68GE/exec"
-
-API_VERSION = "2024-10"
-MAX_WORKERS = 3
-
-# 本地代理配置（当直连失败时自动启用）
-PROXIES = {
-    "http": "http://127.0.0.1:7890",
-    "https": "http://127.0.0.1:7890"
-}
+API_VERSION = "2026-01"
+MAX_WORKERS = 3  # 保持 3 并发，避免高并发断连
 
 FILE_LOCK = threading.Lock()
 
+# 匹配所有包含日期开头的拒付标签（例如 "9.10-欺诈"、"9.16截止-欺诈"、"8.26-未收到产品-已发邮件" 等）
 DISPUTE_TAG_PATTERN = re.compile(r'^(\d{1,2}\.\d{1,2})(?:截止)?-(.+)$')
 
+# 仅用于 Shopify 订单打了简短标签的映射
 SHORT_REASON_MAP = {
     "fraudulent": "欺诈",
     "product_not_received": "未收到产品",
@@ -39,6 +34,7 @@ SHORT_REASON_MAP = {
     "canceled": "其他"
 }
 
+# 保留用于表格导出（N列）的原始详细拒付原因映射
 REASON_MAP = {
     "fraudulent": "欺诈/未授权交易",
     "product_not_received": "未收到货物",
@@ -61,29 +57,20 @@ STATUS_MAP = {
 def get_session():
     return requests.Session()
 
-# ==================== 智能双通道安全请求（先直连，失败自动切代理） ====================
+# ==================== 安全请求包装函数 ====================
 def safe_request(session, method, url, max_retries=5, **kwargs):
-    use_proxy = False  # 默认先尝试直连
-    
     for attempt in range(1, max_retries + 1):
         try:
             kwargs.setdefault("timeout", 20)
-            
-            # 根据当前状态设置代理
-            if use_proxy and PROXIES:
-                session.proxies = PROXIES
-            else:
-                session.proxies = {}
-                
             resp = session.request(method, url, **kwargs)
             
             if resp.status_code == 429:
                 retry_after = resp.headers.get("Retry-After", "2")
                 try:
                     wait_time = float(retry_after)
-                except (ValueError, TypeError):
+                except ValueError:
                     wait_time = 2.0
-                time.sleep(wait_time + 1.0)
+                time.sleep(wait_time + 0.5)
                 continue
             elif resp.status_code in [500, 502, 503, 504]:
                 time.sleep(2 * attempt)
@@ -91,18 +78,7 @@ def safe_request(session, method, url, max_retries=5, **kwargs):
                 
             return resp
             
-        except (requests.exceptions.ConnectionError, requests.exceptions.SSLError, requests.exceptions.Timeout) as e:
-            # 如果直连抛出网络/SSL/超时错误，立即在下一次尝试时开启代理
-            if not use_proxy and PROXIES:
-                use_proxy = True
-                print(f"[网络切换] 直连失败，正在自动切换至本地代理重试...")
-                time.sleep(1)
-                continue
-                
-            if attempt == max_retries:
-                raise e
-            time.sleep(2 * attempt)
-        except Exception as e:
+        except (requests.exceptions.RequestException, Exception) as e:
             if attempt == max_retries:
                 raise e
             time.sleep(2 * attempt)
@@ -119,8 +95,8 @@ def translate_error(error_type, http_status, error_details):
         return "【密钥认证失败 (401)】Client ID / Secret 填写错误或 Token 已失效。"
     elif http_status == 403 or "forbidden" in details_str:
         return "【无接口权限 (403)】当前 App 密钥缺乏 Shopify Payments 或 Orders 的读取权限。"
-    elif "ssleoferror" in details_str or "ssl" in details_str or "eof" in details_str or "connectionerror" in details_str:
-        return "【网络/SSL连接中断】直连与代理均无法稳定连通，请检查网络或代理软件。"
+    elif "ssleoferror" in details_str or "ssl" in details_str or "eof" in details_str:
+        return "【SSL连接中断】网络抖动或并发过高被 Shopify 防火墙切断，脚本已自动重试。"
     elif "field" in details_str and "doesn't exist" in details_str:
         return "【API语法错误】请求中包含了当前 API 版本已废弃或不存在的字段。"
     elif http_status >= 500:
@@ -129,6 +105,7 @@ def translate_error(error_type, http_status, error_details):
         return f"【网络/未知异常】{error_type}: {str(error_details)[:120]}"
 
 def parse_dispute_date(evidence_due_date):
+    """从截止日期中解析出月.日格式"""
     if evidence_due_date and evidence_due_date != "无":
         try:
             dt = datetime.fromisoformat(evidence_due_date.replace("Z", "+00:00"))
@@ -140,6 +117,12 @@ def parse_dispute_date(evidence_due_date):
     return ""
 
 def process_order_tags(tags_list, target_date_str, target_reason_cn):
+    """
+    智能更新标签：
+    1. 扫描原有标签，提取自定义后缀（如'-已发邮件'）；
+    2. 统一词汇并原地修改，删除重复的旧拒付标签；
+    3. 完好保留非拒付备注标签。
+    """
     other_tags = []
     collected_suffixes = []
 
@@ -166,6 +149,7 @@ def process_order_tags(tags_list, target_date_str, target_reason_cn):
     
     return other_tags
 
+# ==================== Token 缓存读写 ====================
 def load_token_cache():
     if os.path.exists(TOKEN_CACHE_FILE):
         try:
@@ -209,6 +193,7 @@ def get_access_token(session, store, cache):
         
     return None
 
+# ==================== 获取订单详情（含智能改标 + 物流提取） ====================
 def get_order_details(session, shop_domain, access_token, order_id, evidence_due_date="", raw_reason=""):
     if not order_id:
         return "N/A", 0.0, "N/A", "N/A", [], "", "无", "无"
@@ -232,6 +217,7 @@ def get_order_details(session, shop_domain, access_token, order_id, evidence_due
             tag_date_str = parse_dispute_date(evidence_due_date)
             target_reason_cn = SHORT_REASON_MAP.get(str(raw_reason).lower(), "其他")
             
+            # 智能更正与归并标签（仅影响订单标签）
             new_tags_list = process_order_tags(tags_list, tag_date_str, target_reason_cn)
             
             if new_tags_list != tags_list:
@@ -247,6 +233,7 @@ def get_order_details(session, shop_domain, access_token, order_id, evidence_due
 
             formatted_tags = "\n".join(tags_list)
             
+            # 解析物流承运商与单号
             fulfillments = ord_data.get("fulfillments", [])
             carriers = []
             tracking_numbers = []
@@ -273,6 +260,7 @@ def get_order_details(session, shop_domain, access_token, order_id, evidence_due
         
     return "N/A", 0.0, "N/A", "N/A", [], "", "无", "无"
 
+# ==================== 单个店铺 API 抓取逻辑 ====================
 def fetch_disputes_for_shop(store, token_cache):
     shop_name = store.get("name", store["domain"])
     shop_domain = store["domain"]
@@ -341,6 +329,8 @@ def fetch_disputes_for_shop(store, token_cache):
 
                 type_cn = TYPE_MAP.get(raw_type, raw_type)
                 status_cn = STATUS_MAP.get(raw_status, raw_status)
+                
+                # N 列保持原始的详细拒付原因描述
                 reason_cn = REASON_MAP.get(raw_reason, raw_reason if raw_reason else "未知原因")
                 
                 evidence_due_date = d.get("evidence_due_by", "") or "无"
@@ -379,7 +369,7 @@ def fetch_disputes_for_shop(store, token_cache):
                     "created_at": d.get("initiated_at", ""),
                     "amount": str(d.get("amount", "0")),
                     "currency": d.get("currency", "USD"),
-                    "reason": reason_cn,
+                    "reason": reason_cn,  # N列数据：保留原始详细描述
                     "customer_name": cust_name,
                     "customer_email": cust_email,
                     "evidence_due_date": evidence_due_date,
@@ -424,6 +414,7 @@ def fetch_disputes_for_shop(store, token_cache):
     
     return parsed_disputes, sync_status, error_logs
 
+# ==================== 分批推送 GAS 防超时引擎 ====================
 def post_to_gas(session, action, item_key, item_list, batch_size=40):
     if not item_list:
         return
@@ -451,6 +442,7 @@ def post_to_gas(session, action, item_key, item_list, batch_size=40):
             else:
                 time.sleep(2)
 
+# ==================== 主流程控制 ====================
 def main():
     if not os.path.exists(STORES_JSON_PATH):
         print(f"错误：找不到店铺配置文件 {STORES_JSON_PATH}")
