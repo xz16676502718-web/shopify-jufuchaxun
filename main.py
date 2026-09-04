@@ -417,7 +417,7 @@ def fetch_disputes_for_shop(store, token_cache):
     
     return parsed_disputes, sync_status, error_logs
 
-# ==================== 分批推送 GAS 防超时引擎（强力抗锁增强版） ====================
+# ==================== 分批推送 GAS 防超时引擎（强力抗锁与校验增强版） ====================
 def post_to_gas(session, action, item_key, item_list, batch_size=30, max_retries=6):
     if not item_list:
         return
@@ -434,17 +434,28 @@ def post_to_gas(session, action, item_key, item_list, batch_size=30, max_retries
             res = safe_request(session, "POST", GAS_WEBHOOK_URL, json=payload, headers=headers, timeout=60)
             if res and res.status_code == 200:
                 try:
-                    res_json = res.json()
-                    if res_json.get("status") == "error" and "Lock timeout" in res_json.get("message", ""):
-                        wait = 3 * (2 ** (attempt - 1)) # 指数退避：3s, 6s, 12s, 24s...
+                    res_json = res.json()  # 严格校验返回内容是否为合法 JSON
+                    
+                    if res_json.get("status") == "success":
+                        print(f"[{action}] 批次 ({i+1}-{min(i+batch_size, total)}/{total}) 推送成功: {res.text}")
+                        success = True
+                        break
+                    elif res_json.get("status") == "error" and "Lock timeout" in res_json.get("message", ""):
+                        wait = 3 * (2 ** (attempt - 1))  # 指数退避：3s, 6s, 12s, 24s...
                         print(f"[{action}] GAS 服务繁忙 (Lock timeout)，等待 {wait} 秒后重试 (第 {attempt}/{max_retries} 次)...")
                         time.sleep(wait)
                         continue
+                    else:
+                        wait = 3 * attempt
+                        print(f"[{action}] GAS 返回了不符合预期的响应: {res.text[:100]}，等待 {wait} 秒后重试 (第 {attempt}/{max_retries} 次)...")
+                        time.sleep(wait)
+                        continue
                 except Exception:
-                    pass
-                print(f"[{action}] 批次 ({i+1}-{min(i+batch_size, total)}/{total}) 推送成功: {res.text}")
-                success = True
-                break
+                    # 捕获 HTML 错误页（如 doGet 异常或 302 自动重定向降级后的 HTML 响应）
+                    wait = 3 * attempt
+                    print(f"[{action}] GAS 返回了非 JSON 响应(疑似重定向或 HTML 错误页)，等待 {wait} 秒后重试 (第 {attempt}/{max_retries} 次)...")
+                    time.sleep(wait)
+                    continue
             else:
                 wait = 3 * attempt
                 print(f"[{action}] 推送异常 (Status: {res.status_code if res else 'None'})，等待 {wait} 秒后重试 (第 {attempt}/{max_retries} 次)...")
@@ -453,7 +464,7 @@ def post_to_gas(session, action, item_key, item_list, batch_size=30, max_retries
         if not success:
             print(f"❌ [{action}] 批次 ({i+1}-{min(i+batch_size, total)}/{total}) 经过 {max_retries} 次重试后仍然失败，请检查 GAS 后端限制！")
             
-        time.sleep(1) # 批次间加入 1 秒缓冲，极大降低 GAS 并发锁冲突
+        time.sleep(1)  # 批次间加入 1 秒缓冲，极大降低 GAS 并发锁冲突
 
 # ==================== 主流程控制 ====================
 def main():
