@@ -263,7 +263,7 @@ def get_order_details(session, shop_domain, access_token, order_id, evidence_due
         
     return "N/A", 0.0, "N/A", "N/A", [], "", "无", "无"
 
-# ==================== 单个店铺 API 抓取逻辑 ====================
+# ==================== 单个店铺 API 抓取逻辑（含自动翻页全量抓取） ====================
 def fetch_disputes_for_shop(store, token_cache):
     shop_name = store.get("name", store["domain"])
     shop_domain = store["domain"]
@@ -305,87 +305,100 @@ def fetch_disputes_for_shop(store, token_cache):
     headers = {"X-Shopify-Access-Token": access_token}
     
     try:
-        response = safe_request(session, "GET", url, headers=headers, timeout=20)
-        
-        if not response or response.status_code != 200:
-            status_code = response.status_code if response else 0
-            err_details = response.text[:200] if response else "安全重试 5 次后网络连接仍中断"
-            explanation = translate_error("HTTPError", status_code, err_details)
-            error_logs.append({
-                "time": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
-                "shop_name": shop_name,
-                "shop_domain": shop_domain,
-                "api": "REST disputes",
-                "http_status": status_code,
-                "error_type": "HTTPError",
-                "error_details": err_details,
-                "retry_count": 5,
-                "error_explanation": explanation
-            })
-        else:
-            disputes = response.json().get("disputes", [])
-            for d in disputes:
-                dispute_id = str(d["id"])
-                raw_type = str(d.get("type", "CHARGEBACK")).upper()
-                raw_status = str(d.get("status", "")).upper()
-                raw_reason = str(d.get("reason", "")).lower()
-
-                type_cn = TYPE_MAP.get(raw_type, raw_type)
-                status_cn = STATUS_MAP.get(raw_status, raw_status)
-                
-                # N 列保持原始的详细拒付原因描述
-                reason_cn = REASON_MAP.get(raw_reason, raw_reason if raw_reason else "未知原因")
-                
-                evidence_due_date = d.get("evidence_due_by", "") or "无"
-                unique_key = f"{shop_domain}|{raw_type}|{dispute_id}"
-                order_id = d.get("order_id")
-                
-                (order_name, order_total, cust_name, cust_email, 
-                 refunds, order_tags, carrier, tracking_number) = get_order_details(
-                    session, shop_domain, access_token, order_id, 
-                    evidence_due_date=evidence_due_date, raw_reason=raw_reason
-                 )
-                
-                refund_count = len(refunds)
-                is_refunded = "是" if refund_count > 0 else "否"
-                total_refunded = 0.0
-                last_refund_at = ""
-                for ref in refunds:
-                    for line_item in ref.get("refund_line_items", []):
-                        total_refunded += float(line_item.get("subtotal", 0.0))
-                    ref_time = ref.get("created_at", "")
-                    if ref_time > last_refund_at:
-                        last_refund_at = ref_time
-                        
-                is_partially_refunded = "是" if (0 < total_refunded < order_total) else "否"
-                needs_response = "是" if raw_status == "NEEDS_RESPONSE" else "否"
-                
-                parsed_disputes.append({
-                    "key": unique_key,
+        # 使用 while 循环自动翻页，直到抓完所有历史页
+        while url:
+            response = safe_request(session, "GET", url, headers=headers, timeout=20)
+            
+            if not response or response.status_code != 200:
+                status_code = response.status_code if response else 0
+                err_details = response.text[:200] if response else "安全重试 5 次后网络连接仍中断"
+                explanation = translate_error("HTTPError", status_code, err_details)
+                error_logs.append({
+                    "time": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
                     "shop_name": shop_name,
                     "shop_domain": shop_domain,
-                    "order_name": order_name,
-                    "order_amount": order_total,
-                    "dispute_id": dispute_id,
-                    "type": type_cn,
-                    "current_status": status_cn,
-                    "created_at": d.get("initiated_at", ""),
-                    "amount": str(d.get("amount", "0")),
-                    "currency": d.get("currency", "USD"),
-                    "reason": reason_cn,  # N列数据：保留原始详细描述
-                    "customer_name": cust_name,
-                    "customer_email": cust_email,
-                    "evidence_due_date": evidence_due_date,
-                    "needs_response": needs_response,
-                    "is_refunded": is_refunded,
-                    "is_partially_refunded": is_partially_refunded,
-                    "refunded_amount": total_refunded,
-                    "last_refund_at": last_refund_at,
-                    "refund_count": refund_count,
-                    "order_tags": order_tags,
-                    "carrier": carrier,
-                    "tracking_number": tracking_number
+                    "api": "REST disputes",
+                    "http_status": status_code,
+                    "error_type": "HTTPError",
+                    "error_details": err_details,
+                    "retry_count": 5,
+                    "error_explanation": explanation
                 })
+                break
+            else:
+                disputes = response.json().get("disputes", [])
+                for d in disputes:
+                    dispute_id = str(d["id"])
+                    raw_type = str(d.get("type", "CHARGEBACK")).upper()
+                    raw_status = str(d.get("status", "")).upper()
+                    raw_reason = str(d.get("reason", "")).lower()
+
+                    type_cn = TYPE_MAP.get(raw_type, raw_type)
+                    status_cn = STATUS_MAP.get(raw_status, raw_status)
+                    reason_cn = REASON_MAP.get(raw_reason, raw_reason if raw_reason else "未知原因")
+                    
+                    evidence_due_date = d.get("evidence_due_by", "") or "无"
+                    unique_key = f"{shop_domain}|{raw_type}|{dispute_id}"
+                    order_id = d.get("order_id")
+                    
+                    (order_name, order_total, cust_name, cust_email, 
+                     refunds, order_tags, carrier, tracking_number) = get_order_details(
+                        session, shop_domain, access_token, order_id, 
+                        evidence_due_date=evidence_due_date, raw_reason=raw_reason
+                     )
+                    
+                    refund_count = len(refunds)
+                    is_refunded = "是" if refund_count > 0 else "否"
+                    total_refunded = 0.0
+                    last_refund_at = ""
+                    for ref in refunds:
+                        for line_item in ref.get("refund_line_items", []):
+                            total_refunded += float(line_item.get("subtotal", 0.0))
+                        ref_time = ref.get("created_at", "")
+                        if ref_time > last_refund_at:
+                            last_refund_at = ref_time
+                            
+                    is_partially_refunded = "是" if (0 < total_refunded < order_total) else "否"
+                    needs_response = "是" if raw_status == "NEEDS_RESPONSE" else "否"
+                    
+                    parsed_disputes.append({
+                        "key": unique_key,
+                        "shop_name": shop_name,
+                        "shop_domain": shop_domain,
+                        "order_name": order_name,
+                        "order_amount": order_total,
+                        "dispute_id": dispute_id,
+                        "type": type_cn,
+                        "current_status": status_cn,
+                        "created_at": d.get("initiated_at", ""),
+                        "amount": str(d.get("amount", "0")),
+                        "currency": d.get("currency", "USD"),
+                        "reason": reason_cn,
+                        "customer_name": cust_name,
+                        "customer_email": cust_email,
+                        "evidence_due_date": evidence_due_date,
+                        "needs_response": needs_response,
+                        "is_refunded": is_refunded,
+                        "is_partially_refunded": is_partially_refunded,
+                        "refunded_amount": total_refunded,
+                        "last_refund_at": last_refund_at,
+                        "refund_count": refund_count,
+                        "order_tags": order_tags,
+                        "carrier": carrier,
+                        "tracking_number": tracking_number
+                    })
+
+                # 解析 Header 中的 Link 寻找下一页 URL
+                link_header = response.headers.get("Link", "")
+                next_url = None
+                if link_header:
+                    links = link_header.split(",")
+                    for link in links:
+                        if 'rel="next"' in link:
+                            next_url = link.split(";")[0].strip("<> ")
+                            break
+                url = next_url  # 如果存在下一页则继续 while 循环，没有则赋值 None 退出循环
+
     except Exception as e:
         err_details = str(e)[:200]
         explanation = translate_error(type(e).__name__, 0, err_details)
