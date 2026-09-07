@@ -14,16 +14,14 @@ TOKEN_CACHE_FILE = "token_cache.json"
 # WebApp 部署地址
 GAS_WEBHOOK_URL = "https://script.google.com/macros/s/AKfycbz5lkaskmNJRA_X0iL_QQyRabeLzmnWmtuTETu3TrUEew7UOXzSd-ccas2yK0h68GE/exec"
 API_VERSION = "2026-01"
-MAX_WORKERS = 3  # 保持 3 并发，避免高并发断连
+MAX_WORKERS = 3  # 保持 3 并发
 
 FILE_LOCK = threading.Lock()
 ORDER_CACHE_LOCK = threading.Lock()
-ORDER_CACHE = {}  # 运行期订单详情缓存，避免同一订单重复请求 API
+ORDER_CACHE = {}  # 运行期订单详情缓存
 
-# 匹配所有包含日期开头的拒付标签（例如 "9.10-欺诈"、"9.16截止-欺诈"、"8.26-未收到产品-已发邮件" 等）
 DISPUTE_TAG_PATTERN = re.compile(r'^(\d{1,2}\.\d{1,2})(?:截止)?-(.+)$')
 
-# 仅用于 Shopify 订单打了简短标签的映射
 SHORT_REASON_MAP = {
     "fraudulent": "欺诈",
     "product_not_received": "未收到产品",
@@ -36,7 +34,6 @@ SHORT_REASON_MAP = {
     "canceled": "其他"
 }
 
-# 保留用于表格导出（N列）的原始详细拒付原因映射
 REASON_MAP = {
     "fraudulent": "欺诈/未授权交易",
     "product_not_received": "未收到货物",
@@ -59,13 +56,11 @@ STATUS_MAP = {
 def get_session():
     return requests.Session()
 
-# ==================== 安全请求包装函数 ====================
 def safe_request(session, method, url, max_retries=5, **kwargs):
     for attempt in range(1, max_retries + 1):
         try:
             kwargs.setdefault("timeout", 20)
             resp = session.request(method, url, **kwargs)
-            
             if resp.status_code == 429:
                 retry_after = resp.headers.get("Retry-After", "2")
                 try:
@@ -77,20 +72,15 @@ def safe_request(session, method, url, max_retries=5, **kwargs):
             elif resp.status_code in [500, 502, 503, 504]:
                 time.sleep(2 * attempt)
                 continue
-                
             return resp
-            
         except (requests.exceptions.RequestException, Exception) as e:
             if attempt == max_retries:
                 raise e
             time.sleep(2 * attempt)
-            
     return None
 
-# ==================== 错误日志自动翻译引擎 ====================
 def translate_error(error_type, http_status, error_details):
     details_str = str(error_details).lower()
-    
     if http_status == 429 or "exceeded" in details_str or "rate limit" in details_str:
         return "【API限流 (429)】请求频率超出Shopify限制，已自动退避重试。"
     elif http_status == 401 or "token" in details_str or "autherror" in str(error_type).lower():
@@ -107,7 +97,6 @@ def translate_error(error_type, http_status, error_details):
         return f"【网络/未知异常】{error_type}: {str(error_details)[:120]}"
 
 def parse_dispute_date(evidence_due_date):
-    """从截止日期中解析出月.日格式"""
     if evidence_due_date and evidence_due_date != "无":
         try:
             dt = datetime.fromisoformat(evidence_due_date.replace("Z", "+00:00"))
@@ -119,12 +108,6 @@ def parse_dispute_date(evidence_due_date):
     return ""
 
 def process_order_tags(tags_list, target_date_str, target_reason_cn):
-    """
-    智能更新标签：
-    1. 扫描原有标签，提取自定义后缀（如'-已发邮件'）；
-    2. 统一词汇并原地修改，删除重复的旧拒付标签；
-    3. 完好保留非拒付备注标签。
-    """
     other_tags = []
     collected_suffixes = []
 
@@ -151,7 +134,6 @@ def process_order_tags(tags_list, target_date_str, target_reason_cn):
     
     return other_tags
 
-# ==================== Token 缓存读写 ====================
 def load_token_cache():
     if os.path.exists(TOKEN_CACHE_FILE):
         try:
@@ -165,7 +147,7 @@ def save_token_cache(cache):
     with FILE_LOCK:
         try:
             dir_name = os.path.dirname(TOKEN_CACHE_FILE)
-            if dir_name:  # 只有当包含子目录时才创建文件夹
+            if dir_name:
                 os.makedirs(dir_name, exist_ok=True)
             with open(TOKEN_CACHE_FILE, "w", encoding="utf-8") as f:
                 json.dump(cache, f, ensure_ascii=False, indent=2)
@@ -197,12 +179,10 @@ def get_access_token(session, store, cache):
         
     return None
 
-# ==================== 获取订单详情（含智能改标 + 物流提取 + 内存缓存） ====================
 def get_order_details(session, shop_domain, access_token, order_id, evidence_due_date="", raw_reason=""):
     if not order_id:
         return "N/A", 0.0, "N/A", "N/A", [], "", "无", "无"
     
-    # 优先查内存缓存，避免同店铺重复查询同一订单
     cache_key = f"{shop_domain}|{order_id}"
     with ORDER_CACHE_LOCK:
         if cache_key in ORDER_CACHE:
@@ -227,10 +207,8 @@ def get_order_details(session, shop_domain, access_token, order_id, evidence_due
             tag_date_str = parse_dispute_date(evidence_due_date)
             target_reason_cn = SHORT_REASON_MAP.get(str(raw_reason).lower(), "其他")
             
-            # 智能更正与归并标签（仅影响订单标签）
             new_tags_list = process_order_tags(tags_list, tag_date_str, target_reason_cn)
             
-            # 使用 set 对比，避免因为列表标签顺序不同而触发不必要的 API 更新
             if set(new_tags_list) != set(tags_list):
                 new_tags_str = ", ".join(new_tags_list)
                 update_url = f"https://{shop_domain}/admin/api/{API_VERSION}/orders/{order_id}.json"
@@ -244,7 +222,6 @@ def get_order_details(session, shop_domain, access_token, order_id, evidence_due
 
             formatted_tags = "\n".join(tags_list)
             
-            # 解析物流承运商与单号
             fulfillments = ord_data.get("fulfillments", [])
             carriers = []
             tracking_numbers = []
@@ -274,7 +251,6 @@ def get_order_details(session, shop_domain, access_token, order_id, evidence_due
         
     return "N/A", 0.0, "N/A", "N/A", [], "", "无", "无"
 
-# ==================== 单个店铺 API 抓取逻辑（全量抓取不漏查） ====================
 def fetch_disputes_for_shop(store, token_cache):
     shop_name = store.get("name", store["domain"])
     shop_domain = store["domain"]
@@ -316,7 +292,6 @@ def fetch_disputes_for_shop(store, token_cache):
     headers = {"X-Shopify-Access-Token": access_token}
     
     try:
-        # 使用 while 循环自动翻页，直到抓完所有历史页
         while url:
             response = safe_request(session, "GET", url, headers=headers, timeout=20)
             
@@ -349,10 +324,11 @@ def fetch_disputes_for_shop(store, token_cache):
                     reason_cn = REASON_MAP.get(raw_reason, raw_reason if raw_reason else "未知原因")
                     
                     evidence_due_date = d.get("evidence_due_by", "") or "无"
-                    unique_key = f"{shop_domain}|{raw_type}|{dispute_id}"
+                    
+                    # 关键修改：主键不含 raw_type，确保调单升级为拒付时直接覆盖更新原行
+                    unique_key = f"{shop_domain}|{dispute_id}"
                     order_id = d.get("order_id")
                     
-                    # 全量获取订单详情，确保不留 N/A 空白
                     (order_name, order_total, cust_name, cust_email, 
                      refunds, order_tags, carrier, tracking_number) = get_order_details(
                         session, shop_domain, access_token, order_id, 
@@ -400,7 +376,6 @@ def fetch_disputes_for_shop(store, token_cache):
                         "tracking_number": tracking_number
                     })
 
-                # 解析 Header 中的 Link 寻找下一页 URL
                 link_header = response.headers.get("Link", "")
                 next_url = None
                 if link_header:
@@ -409,7 +384,7 @@ def fetch_disputes_for_shop(store, token_cache):
                         if 'rel="next"' in link:
                             next_url = link.split(";")[0].strip("<> ")
                             break
-                url = next_url  # 如果存在下一页则继续 while 循环，没有则赋值 None 退出循环
+                url = next_url
 
     except Exception as e:
         err_details = str(e)[:200]
@@ -442,7 +417,6 @@ def fetch_disputes_for_shop(store, token_cache):
     
     return parsed_disputes, sync_status, error_logs
 
-# ==================== 分批推送 GAS 防超时引擎（强力抗锁与校验增强版） ====================
 def post_to_gas(session, action, item_key, item_list, batch_size=30, max_retries=6):
     if not item_list:
         return
@@ -459,14 +433,13 @@ def post_to_gas(session, action, item_key, item_list, batch_size=30, max_retries
             res = safe_request(session, "POST", GAS_WEBHOOK_URL, json=payload, headers=headers, timeout=60)
             if res and res.status_code == 200:
                 try:
-                    res_json = res.json()  # 严格校验返回内容是否为合法 JSON
-                    
+                    res_json = res.json()
                     if res_json.get("status") == "success":
                         print(f"[{action}] 批次 ({i+1}-{min(i+batch_size, total)}/{total}) 推送成功: {res.text}")
                         success = True
                         break
                     elif res_json.get("status") == "error" and "Lock timeout" in res_json.get("message", ""):
-                        wait = 3 * (2 ** (attempt - 1))  # 指数退避：3s, 6s, 12s, 24s...
+                        wait = 3 * (2 ** (attempt - 1))
                         print(f"[{action}] GAS 服务繁忙 (Lock timeout)，等待 {wait} 秒后重试 (第 {attempt}/{max_retries} 次)...")
                         time.sleep(wait)
                         continue
@@ -476,9 +449,8 @@ def post_to_gas(session, action, item_key, item_list, batch_size=30, max_retries
                         time.sleep(wait)
                         continue
                 except Exception:
-                    # 捕获 HTML 错误页（如 doGet 异常或 302 自动重定向降级后的 HTML 响应）
                     wait = 3 * attempt
-                    print(f"[{action}] GAS 返回了非 JSON 响应(疑似重定向或 HTML 错误页)，等待 {wait} 秒后重试 (第 {attempt}/{max_retries} 次)...")
+                    print(f"[{action}] GAS 返回了非 JSON 响应，等待 {wait} 秒后重试 (第 {attempt}/{max_retries} 次)...")
                     time.sleep(wait)
                     continue
             else:
@@ -489,9 +461,8 @@ def post_to_gas(session, action, item_key, item_list, batch_size=30, max_retries
         if not success:
             print(f"❌ [{action}] 批次 ({i+1}-{min(i+batch_size, total)}/{total}) 经过 {max_retries} 次重试后仍然失败，请检查 GAS 后端限制！")
             
-        time.sleep(1)  # 批次间加入 1 秒缓冲，极大降低 GAS 并发锁冲突
+        time.sleep(1)
 
-# ==================== 主流程控制 ====================
 def main():
     if not os.path.exists(STORES_JSON_PATH):
         print(f"错误：找不到店铺配置文件 {STORES_JSON_PATH}")
