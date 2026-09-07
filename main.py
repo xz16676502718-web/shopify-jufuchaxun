@@ -188,14 +188,23 @@ def get_order_details(session, shop_domain, access_token, order_id, evidence_due
         if cache_key in ORDER_CACHE:
             return ORDER_CACHE[cache_key]
 
-    url = f"https://{shop_domain}/admin/api/{API_VERSION}/orders/{order_id}.json?fields=id,name,total_price,customer,refunds,tags,fulfillments"
+    # 在 fields 中加入 total_price_set 以获取顾客支付原币种金额
+    url = f"https://{shop_domain}/admin/api/{API_VERSION}/orders/{order_id}.json?fields=id,name,total_price,total_price_set,customer,refunds,tags,fulfillments"
     headers = {"X-Shopify-Access-Token": access_token}
     try:
         res = safe_request(session, "GET", url, headers=headers, timeout=15)
         if res and res.status_code == 200:
             ord_data = res.json().get("order", {})
             order_name = ord_data.get("name", "N/A")
-            order_total = float(ord_data.get("total_price", 0.0))
+            
+            # 优先提取顾客支付的呈现币种金额（例如 78.00 AUD），若无则回退到店铺本位币金额
+            price_set = ord_data.get("total_price_set") or {}
+            presentment_money = price_set.get("presentment_money") or {}
+            if "amount" in presentment_money and presentment_money.get("amount") is not None:
+                order_total = float(presentment_money.get("amount", 0.0))
+            else:
+                order_total = float(ord_data.get("total_price", 0.0))
+
             cust = ord_data.get("customer") or {}
             cust_name = f"{cust.get('first_name', '')} {cust.get('last_name', '')}".strip() or "N/A"
             cust_email = cust.get('email', '') or "N/A"
