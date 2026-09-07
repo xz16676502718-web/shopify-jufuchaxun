@@ -17,6 +17,8 @@ API_VERSION = "2026-01"
 MAX_WORKERS = 3  # 保持 3 并发，避免高并发断连
 
 FILE_LOCK = threading.Lock()
+ORDER_CACHE_LOCK = threading.Lock()
+ORDER_CACHE = {}  # 运行期订单详情缓存，避免同一订单重复请求 API
 
 # 匹配所有包含日期开头的拒付标签（例如 "9.10-欺诈"、"9.16截止-欺诈"、"8.26-未收到产品-已发邮件" 等）
 DISPUTE_TAG_PATTERN = re.compile(r'^(\d{1,2}\.\d{1,2})(?:截止)?-(.+)$')
@@ -54,9 +56,6 @@ STATUS_MAP = {
     "ACCEPTED": "已接受(放弃申诉)", "CHARGE_REFUNDED": "已全额退款"
 }
 
-# 终态列表：已结束的拒付状态
-TERMINAL_STATUSES = {"WON", "LOST", "ACCEPTED", "CHARGE_REFUNDED"}
-
 def get_session():
     return requests.Session()
 
@@ -87,20 +86,6 @@ def safe_request(session, method, url, max_retries=5, **kwargs):
             time.sleep(2 * attempt)
             
     return None
-
-# ==================== 判断是否为超过30天的历史终态案件 ====================
-def is_old_closed_dispute(raw_status, initiated_at_str):
-    """判断是否为超过 30 天且状态已终结的旧案件"""
-    if raw_status not in TERMINAL_STATUSES:
-        return False
-    if not initiated_at_str:
-        return False
-    try:
-        dt = datetime.fromisoformat(initiated_at_str.replace("Z", "+00:00"))
-        now = datetime.now(timezone.utc)
-        return (now - dt).days > 30
-    except Exception:
-        return False
 
 # ==================== 错误日志自动翻译引擎 ====================
 def translate_error(error_type, http_status, error_details):
@@ -212,11 +197,17 @@ def get_access_token(session, store, cache):
         
     return None
 
-# ==================== 获取订单详情（含智能改标 + 物流提取） ====================
+# ==================== 获取订单详情（含智能改标 + 物流提取 + 内存缓存） ====================
 def get_order_details(session, shop_domain, access_token, order_id, evidence_due_date="", raw_reason=""):
     if not order_id:
         return "N/A", 0.0, "N/A", "N/A", [], "", "无", "无"
     
+    # 优先查内存缓存，避免同店铺重复查询同一订单
+    cache_key = f"{shop_domain}|{order_id}"
+    with ORDER_CACHE_LOCK:
+        if cache_key in ORDER_CACHE:
+            return ORDER_CACHE[cache_key]
+
     url = f"https://{shop_domain}/admin/api/{API_VERSION}/orders/{order_id}.json?fields=id,name,total_price,customer,refunds,tags,fulfillments"
     headers = {"X-Shopify-Access-Token": access_token}
     try:
@@ -274,13 +265,16 @@ def get_order_details(session, shop_domain, access_token, order_id, evidence_due
             carrier_str = "\n".join(carriers) if carriers else "无"
             tracking_str = "\n".join(tracking_numbers) if tracking_numbers else "无"
             
-            return order_name, order_total, cust_name, cust_email, refunds, formatted_tags, carrier_str, tracking_str
+            result = (order_name, order_total, cust_name, cust_email, refunds, formatted_tags, carrier_str, tracking_str)
+            with ORDER_CACHE_LOCK:
+                ORDER_CACHE[cache_key] = result
+            return result
     except Exception as e:
         print(f"[{shop_domain}] 获取订单 {order_id} 详情异常: {e}")
         
     return "N/A", 0.0, "N/A", "N/A", [], "", "无", "无"
 
-# ==================== 单个店铺 API 抓取逻辑（含自动翻页与历史老单跳过优化） ====================
+# ==================== 单个店铺 API 抓取逻辑（全量抓取不漏查） ====================
 def fetch_disputes_for_shop(store, token_cache):
     shop_name = store.get("name", store["domain"])
     shop_domain = store["domain"]
@@ -349,7 +343,6 @@ def fetch_disputes_for_shop(store, token_cache):
                     raw_type = str(d.get("type", "CHARGEBACK")).upper()
                     raw_status = str(d.get("status", "")).upper()
                     raw_reason = str(d.get("reason", "")).lower()
-                    initiated_at = d.get("initiated_at", "")
 
                     type_cn = TYPE_MAP.get(raw_type, raw_type)
                     status_cn = STATUS_MAP.get(raw_status, raw_status)
@@ -359,17 +352,12 @@ def fetch_disputes_for_shop(store, token_cache):
                     unique_key = f"{shop_domain}|{raw_type}|{dispute_id}"
                     order_id = d.get("order_id")
                     
-                    # 校验是否属于超过 30 天的终态旧案件[cite: 4]
-                    if is_old_closed_dispute(raw_status, initiated_at):
-                        # 直接跳过 get_order_details API 查询，填充默认占位符[cite: 4]
-                        order_name, order_total, cust_name, cust_email = "N/A", 0.0, "N/A", "N/A"
-                        refunds, order_tags, carrier, tracking_number = [], "历史沉淀记录(跳过详情)", "无", "无"
-                    else:
-                        (order_name, order_total, cust_name, cust_email, 
-                         refunds, order_tags, carrier, tracking_number) = get_order_details(
-                            session, shop_domain, access_token, order_id, 
-                            evidence_due_date=evidence_due_date, raw_reason=raw_reason
-                         )
+                    # 全量获取订单详情，确保不留 N/A 空白
+                    (order_name, order_total, cust_name, cust_email, 
+                     refunds, order_tags, carrier, tracking_number) = get_order_details(
+                        session, shop_domain, access_token, order_id, 
+                        evidence_due_date=evidence_due_date, raw_reason=raw_reason
+                     )
                     
                     refund_count = len(refunds)
                     is_refunded = "是" if refund_count > 0 else "否"
@@ -394,7 +382,7 @@ def fetch_disputes_for_shop(store, token_cache):
                         "dispute_id": dispute_id,
                         "type": type_cn,
                         "current_status": status_cn,
-                        "created_at": initiated_at,
+                        "created_at": d.get("initiated_at", ""),
                         "amount": str(d.get("amount", "0")),
                         "currency": d.get("currency", "USD"),
                         "reason": reason_cn,
