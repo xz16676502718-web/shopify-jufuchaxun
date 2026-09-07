@@ -54,6 +54,9 @@ STATUS_MAP = {
     "ACCEPTED": "已接受(放弃申诉)", "CHARGE_REFUNDED": "已全额退款"
 }
 
+# 终态列表：已结束的拒付状态
+TERMINAL_STATUSES = {"WON", "LOST", "ACCEPTED", "CHARGE_REFUNDED"}
+
 def get_session():
     return requests.Session()
 
@@ -84,6 +87,20 @@ def safe_request(session, method, url, max_retries=5, **kwargs):
             time.sleep(2 * attempt)
             
     return None
+
+# ==================== 判断是否为超过30天的历史终态案件 ====================
+def is_old_closed_dispute(raw_status, initiated_at_str):
+    """判断是否为超过 30 天且状态已终结的旧案件"""
+    if raw_status not in TERMINAL_STATUSES:
+        return False
+    if not initiated_at_str:
+        return False
+    try:
+        dt = datetime.fromisoformat(initiated_at_str.replace("Z", "+00:00"))
+        now = datetime.now(timezone.utc)
+        return (now - dt).days > 30
+    except Exception:
+        return False
 
 # ==================== 错误日志自动翻译引擎 ====================
 def translate_error(error_type, http_status, error_details):
@@ -263,7 +280,7 @@ def get_order_details(session, shop_domain, access_token, order_id, evidence_due
         
     return "N/A", 0.0, "N/A", "N/A", [], "", "无", "无"
 
-# ==================== 单个店铺 API 抓取逻辑（含自动翻页全量抓取） ====================
+# ==================== 单个店铺 API 抓取逻辑（含自动翻页与历史老单跳过优化） ====================
 def fetch_disputes_for_shop(store, token_cache):
     shop_name = store.get("name", store["domain"])
     shop_domain = store["domain"]
@@ -332,6 +349,7 @@ def fetch_disputes_for_shop(store, token_cache):
                     raw_type = str(d.get("type", "CHARGEBACK")).upper()
                     raw_status = str(d.get("status", "")).upper()
                     raw_reason = str(d.get("reason", "")).lower()
+                    initiated_at = d.get("initiated_at", "")
 
                     type_cn = TYPE_MAP.get(raw_type, raw_type)
                     status_cn = STATUS_MAP.get(raw_status, raw_status)
@@ -341,11 +359,17 @@ def fetch_disputes_for_shop(store, token_cache):
                     unique_key = f"{shop_domain}|{raw_type}|{dispute_id}"
                     order_id = d.get("order_id")
                     
-                    (order_name, order_total, cust_name, cust_email, 
-                     refunds, order_tags, carrier, tracking_number) = get_order_details(
-                        session, shop_domain, access_token, order_id, 
-                        evidence_due_date=evidence_due_date, raw_reason=raw_reason
-                     )
+                    # 校验是否属于超过 30 天的终态旧案件[cite: 4]
+                    if is_old_closed_dispute(raw_status, initiated_at):
+                        # 直接跳过 get_order_details API 查询，填充默认占位符[cite: 4]
+                        order_name, order_total, cust_name, cust_email = "N/A", 0.0, "N/A", "N/A"
+                        refunds, order_tags, carrier, tracking_number = [], "历史沉淀记录(跳过详情)", "无", "无"
+                    else:
+                        (order_name, order_total, cust_name, cust_email, 
+                         refunds, order_tags, carrier, tracking_number) = get_order_details(
+                            session, shop_domain, access_token, order_id, 
+                            evidence_due_date=evidence_due_date, raw_reason=raw_reason
+                         )
                     
                     refund_count = len(refunds)
                     is_refunded = "是" if refund_count > 0 else "否"
@@ -370,7 +394,7 @@ def fetch_disputes_for_shop(store, token_cache):
                         "dispute_id": dispute_id,
                         "type": type_cn,
                         "current_status": status_cn,
-                        "created_at": d.get("initiated_at", ""),
+                        "created_at": initiated_at,
                         "amount": str(d.get("amount", "0")),
                         "currency": d.get("currency", "USD"),
                         "reason": reason_cn,
