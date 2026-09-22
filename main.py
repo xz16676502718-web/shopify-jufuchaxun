@@ -56,28 +56,44 @@ STATUS_MAP = {
 def get_session():
     return requests.Session()
 
+# 优化 1：改进安全请求函数，补充浏览器 Header，优化超时与响应保留
 def safe_request(session, method, url, max_retries=5, **kwargs):
+    # 分离连接超时 (5s) 与读取超时 (20s)
+    kwargs.setdefault("timeout", (5, 20))
+    
+    # 补充标准请求头，防止 GitHub Actions 环境被 Cloudflare 防火墙作为 Bot 拦截
+    headers = kwargs.get("headers", {})
+    headers.setdefault("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+    headers.setdefault("Accept", "application/json")
+    kwargs["headers"] = headers
+
+    last_resp = None
+
     for attempt in range(1, max_retries + 1):
         try:
-            kwargs.setdefault("timeout", 20)
             resp = session.request(method, url, **kwargs)
+            last_resp = resp
+            
             if resp.status_code == 429:
                 retry_after = resp.headers.get("Retry-After", "2")
                 try:
                     wait_time = float(retry_after)
                 except ValueError:
                     wait_time = 2.0
-                time.sleep(wait_time + 0.5)
+                time.sleep(wait_time + attempt * 0.5)
                 continue
             elif resp.status_code in [500, 502, 503, 504]:
                 time.sleep(2 * attempt)
                 continue
+                
             return resp
         except (requests.exceptions.RequestException, Exception) as e:
             if attempt == max_retries:
                 raise e
             time.sleep(2 * attempt)
-    return None
+            
+    # 如果 5 次重试均返回 429 或 50x，返回最后的响应对象，避免返回 None 导致上层丢失真实状态码
+    return last_resp
 
 def translate_error(error_type, http_status, error_details):
     details_str = str(error_details).lower()
@@ -87,6 +103,8 @@ def translate_error(error_type, http_status, error_details):
         return "【密钥认证失败 (401)】Client ID / Secret 填写错误或 Token 已失效。"
     elif http_status == 403 or "forbidden" in details_str:
         return "【无接口权限 (403)】当前 App 密钥缺乏 Shopify Payments 或 Orders 的读取权限。"
+    elif http_status == 404:
+        return "【接口不存在 (404)】该店铺可能未开通 Shopify Payments 或域名无效。"
     elif "ssleoferror" in details_str or "ssl" in details_str or "eof" in details_str:
         return "【SSL连接中断】网络抖动或并发过高被 Shopify 防火墙切断，脚本已自动重试。"
     elif "field" in details_str and "doesn't exist" in details_str:
@@ -94,7 +112,7 @@ def translate_error(error_type, http_status, error_details):
     elif http_status >= 500:
         return f"【Shopify服务端故障 ({http_status})】Shopify 官方服务器暂时崩溃，稍后重试即可。"
     else:
-        return f"【网络/未知异常】{error_type}: {str(error_details)[:120]}"
+        return f"【网络/未知异常】{error_type} (HTTP {http_status}): {str(error_details)[:120]}"
 
 def parse_dispute_date(evidence_due_date):
     if evidence_due_date and evidence_due_date != "无":
@@ -166,7 +184,7 @@ def get_access_token(session, store, cache):
     payload = {"client_id": client_id, "client_secret": client_secret, "grant_type": "client_credentials"}
     
     try:
-        resp = safe_request(session, "POST", token_url, json=payload, timeout=15)
+        resp = safe_request(session, "POST", token_url, json=payload)
         if resp and resp.status_code == 200:
             token_data = resp.json()
             access_token = token_data.get("access_token")
@@ -188,16 +206,14 @@ def get_order_details(session, shop_domain, access_token, order_id, evidence_due
         if cache_key in ORDER_CACHE:
             return ORDER_CACHE[cache_key]
 
-    # 在 fields 中加入 total_price_set 以获取顾客支付原币种金额
     url = f"https://{shop_domain}/admin/api/{API_VERSION}/orders/{order_id}.json?fields=id,name,total_price,total_price_set,customer,refunds,tags,fulfillments"
     headers = {"X-Shopify-Access-Token": access_token}
     try:
-        res = safe_request(session, "GET", url, headers=headers, timeout=15)
+        res = safe_request(session, "GET", url, headers=headers)
         if res and res.status_code == 200:
             ord_data = res.json().get("order", {})
             order_name = ord_data.get("name", "N/A")
             
-            # 优先提取顾客支付的呈现币种金额（例如 78.00 AUD），若无则回退到店铺本位币金额
             price_set = ord_data.get("total_price_set") or {}
             presentment_money = price_set.get("presentment_money") or {}
             if "amount" in presentment_money and presentment_money.get("amount") is not None:
@@ -224,7 +240,7 @@ def get_order_details(session, shop_domain, access_token, order_id, evidence_due
                 update_headers = {"X-Shopify-Access-Token": access_token, "Content-Type": "application/json"}
                 update_payload = {"order": {"id": order_id, "tags": new_tags_str}}
                 
-                update_res = safe_request(session, "PUT", update_url, headers=update_headers, json=update_payload, timeout=15)
+                update_res = safe_request(session, "PUT", update_url, headers=update_headers, json=update_payload)
                 if update_res and update_res.status_code == 200:
                     tags_list = new_tags_list
                     print(f"[{shop_domain}] 订单 {order_name} 标签已更正更新为: {new_tags_str}")
@@ -302,11 +318,11 @@ def fetch_disputes_for_shop(store, token_cache):
     
     try:
         while url:
-            response = safe_request(session, "GET", url, headers=headers, timeout=20)
+            response = safe_request(session, "GET", url, headers=headers)
             
             if not response or response.status_code != 200:
                 status_code = response.status_code if response else 0
-                err_details = response.text[:200] if response else "安全重试 5 次后网络连接仍中断"
+                err_details = response.text[:200] if response else "网络连接超时或响应为空"
                 explanation = translate_error("HTTPError", status_code, err_details)
                 error_logs.append({
                     "time": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
@@ -334,7 +350,6 @@ def fetch_disputes_for_shop(store, token_cache):
                     
                     evidence_due_date = d.get("evidence_due_by", "") or "无"
                     
-                    # 关键修改：主键不含 raw_type，确保调单升级为拒付时直接覆盖更新原行
                     unique_key = f"{shop_domain}|{dispute_id}"
                     order_id = d.get("order_id")
                     
@@ -439,7 +454,7 @@ def post_to_gas(session, action, item_key, item_list, batch_size=30, max_retries
         success = False
         
         for attempt in range(1, max_retries + 1):
-            res = safe_request(session, "POST", GAS_WEBHOOK_URL, json=payload, headers=headers, timeout=60)
+            res = safe_request(session, "POST", GAS_WEBHOOK_URL, json=payload, headers=headers)
             if res and res.status_code == 200:
                 try:
                     res_json = res.json()
