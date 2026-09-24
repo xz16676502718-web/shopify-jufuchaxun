@@ -56,12 +56,9 @@ STATUS_MAP = {
 def get_session():
     return requests.Session()
 
-# 优化 1：改进安全请求函数，补充浏览器 Header，优化超时与响应保留
 def safe_request(session, method, url, max_retries=5, **kwargs):
-    # 分离连接超时 (5s) 与读取超时 (20s)
-    kwargs.setdefault("timeout", (5, 20))
+    kwargs.setdefault("timeout", (10, 30))
     
-    # 补充标准请求头，防止 GitHub Actions 环境被 Cloudflare 防火墙作为 Bot 拦截
     headers = kwargs.get("headers", {})
     headers.setdefault("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
     headers.setdefault("Accept", "application/json")
@@ -92,7 +89,6 @@ def safe_request(session, method, url, max_retries=5, **kwargs):
                 raise e
             time.sleep(2 * attempt)
             
-    # 如果 5 次重试均返回 429 或 50x，返回最后的响应对象，避免返回 None 导致上层丢失真实状态码
     return last_resp
 
 def translate_error(error_type, http_status, error_details):
@@ -176,6 +172,7 @@ def get_access_token(session, store, cache):
     domain = store["domain"]
     client_id = store["client_id"]
     client_secret = store["client_secret"]
+    shop_name = store.get("name", domain)
 
     if domain in cache and "access_token" in cache[domain]:
         return cache[domain]["access_token"]
@@ -193,11 +190,11 @@ def get_access_token(session, store, cache):
                 save_token_cache(cache)
                 return access_token
     except Exception as e:
-        print(f"[{domain}] 请求 Token 异常: {e}")
+        print(f"[{shop_name}] 请求 Token 异常: {e}")
         
     return None
 
-def get_order_details(session, shop_domain, access_token, order_id, evidence_due_date="", raw_reason=""):
+def get_order_details(session, shop_name, shop_domain, access_token, order_id, evidence_due_date="", raw_reason=""):
     if not order_id:
         return "N/A", 0.0, "N/A", "N/A", [], "", "无", "无"
     
@@ -243,7 +240,8 @@ def get_order_details(session, shop_domain, access_token, order_id, evidence_due
                 update_res = safe_request(session, "PUT", update_url, headers=update_headers, json=update_payload)
                 if update_res and update_res.status_code == 200:
                     tags_list = new_tags_list
-                    print(f"[{shop_domain}] 订单 {order_name} 标签已更正更新为: {new_tags_str}")
+                    # 显示店铺名称而非域名
+                    print(f"***{shop_name}*** 订单 {order_name} 标签已更正更新为: {new_tags_str}")
 
             formatted_tags = "\n".join(tags_list)
             
@@ -272,7 +270,7 @@ def get_order_details(session, shop_domain, access_token, order_id, evidence_due
                 ORDER_CACHE[cache_key] = result
             return result
     except Exception as e:
-        print(f"[{shop_domain}] 获取订单 {order_id} 详情异常: {e}")
+        print(f"[{shop_name}] 获取订单 {order_id} 详情异常: {e}")
         
     return "N/A", 0.0, "N/A", "N/A", [], "", "无", "无"
 
@@ -355,7 +353,7 @@ def fetch_disputes_for_shop(store, token_cache):
                     
                     (order_name, order_total, cust_name, cust_email, 
                      refunds, order_tags, carrier, tracking_number) = get_order_details(
-                        session, shop_domain, access_token, order_id, 
+                        session, shop_name, shop_domain, access_token, order_id, 
                         evidence_due_date=evidence_due_date, raw_reason=raw_reason
                      )
                     
@@ -454,7 +452,6 @@ def post_to_gas(session, action, item_key, item_list, batch_size=30, max_retries
         success = False
         
         for attempt in range(1, max_retries + 1):
-            # 关键修改：增加 timeout=(10, 60) 容忍 GAS 的排队与处理延时
             res = safe_request(session, "POST", GAS_WEBHOOK_URL, json=payload, headers=headers, timeout=(10, 60))
             if res and res.status_code == 200:
                 try:
