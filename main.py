@@ -454,7 +454,8 @@ def post_to_gas(session, action, item_key, item_list, batch_size=30, max_retries
         success = False
         
         for attempt in range(1, max_retries + 1):
-            res = safe_request(session, "POST", GAS_WEBHOOK_URL, json=payload, headers=headers)
+            # 关键修改：增加 timeout=(10, 60) 容忍 GAS 的排队与处理延时
+            res = safe_request(session, "POST", GAS_WEBHOOK_URL, json=payload, headers=headers, timeout=(10, 60))
             if res and res.status_code == 200:
                 try:
                     res_json = res.json()
