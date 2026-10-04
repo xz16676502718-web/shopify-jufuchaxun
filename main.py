@@ -14,7 +14,10 @@ TOKEN_CACHE_FILE = "token_cache.json"
 # WebApp 部署地址
 GAS_WEBHOOK_URL = "https://script.google.com/macros/s/AKfycbz5lkaskmNJRA_X0iL_QQyRabeLzmnWmtuTETu3TrUEew7UOXzSd-ccas2yK0h68GE/exec"
 API_VERSION = "2026-01"
-MAX_WORKERS = 3  # 保持 3 并发
+
+# 核心性能配置
+MAX_STORE_WORKERS = 10  # 店铺级并发数（从 3 提升至 10）
+MAX_ORDER_WORKERS = 4   # 单店内部订单详情并发数
 
 FILE_LOCK = threading.Lock()
 ORDER_CACHE_LOCK = threading.Lock()
@@ -54,7 +57,11 @@ STATUS_MAP = {
 }
 
 def get_session():
-    return requests.Session()
+    session = requests.Session()
+    # 增加连接池容量以适应更高并发
+    adapter = requests.adapters.HTTPAdapter(pool_connections=20, pool_maxsize=20)
+    session.mount("https://", adapter)
+    return session
 
 def safe_request(session, method, url, max_retries=5, **kwargs):
     kwargs.setdefault("timeout", (10, 30))
@@ -240,7 +247,6 @@ def get_order_details(session, shop_name, shop_domain, access_token, order_id, e
                 update_res = safe_request(session, "PUT", update_url, headers=update_headers, json=update_payload)
                 if update_res and update_res.status_code == 200:
                     tags_list = new_tags_list
-                    # 显示店铺名称而非域名
                     print(f"***{shop_name}*** 订单 {order_name} 标签已更正更新为: {new_tags_str}")
 
             formatted_tags = "\n".join(tags_list)
@@ -314,6 +320,7 @@ def fetch_disputes_for_shop(store, token_cache):
     url = f"https://{shop_domain}/admin/api/{API_VERSION}/shopify_payments/disputes.json?limit=250"
     headers = {"X-Shopify-Access-Token": access_token}
     
+    raw_dispute_items = []
     try:
         while url:
             response = safe_request(session, "GET", url, headers=headers)
@@ -336,67 +343,7 @@ def fetch_disputes_for_shop(store, token_cache):
                 break
             else:
                 disputes = response.json().get("disputes", [])
-                for d in disputes:
-                    dispute_id = str(d["id"])
-                    raw_type = str(d.get("type", "CHARGEBACK")).upper()
-                    raw_status = str(d.get("status", "")).upper()
-                    raw_reason = str(d.get("reason", "")).lower()
-
-                    type_cn = TYPE_MAP.get(raw_type, raw_type)
-                    status_cn = STATUS_MAP.get(raw_status, raw_status)
-                    reason_cn = REASON_MAP.get(raw_reason, raw_reason if raw_reason else "未知原因")
-                    
-                    evidence_due_date = d.get("evidence_due_by", "") or "无"
-                    
-                    unique_key = f"{shop_domain}|{dispute_id}"
-                    order_id = d.get("order_id")
-                    
-                    (order_name, order_total, cust_name, cust_email, 
-                     refunds, order_tags, carrier, tracking_number) = get_order_details(
-                        session, shop_name, shop_domain, access_token, order_id, 
-                        evidence_due_date=evidence_due_date, raw_reason=raw_reason
-                     )
-                    
-                    refund_count = len(refunds)
-                    is_refunded = "是" if refund_count > 0 else "否"
-                    total_refunded = 0.0
-                    last_refund_at = ""
-                    for ref in refunds:
-                        for line_item in ref.get("refund_line_items", []):
-                            total_refunded += float(line_item.get("subtotal", 0.0))
-                        ref_time = ref.get("created_at", "")
-                        if ref_time > last_refund_at:
-                            last_refund_at = ref_time
-                            
-                    is_partially_refunded = "是" if (0 < total_refunded < order_total) else "否"
-                    needs_response = "是" if raw_status == "NEEDS_RESPONSE" else "否"
-                    
-                    parsed_disputes.append({
-                        "key": unique_key,
-                        "shop_name": shop_name,
-                        "shop_domain": shop_domain,
-                        "order_name": order_name,
-                        "order_amount": order_total,
-                        "dispute_id": dispute_id,
-                        "type": type_cn,
-                        "current_status": status_cn,
-                        "created_at": d.get("initiated_at", ""),
-                        "amount": str(d.get("amount", "0")),
-                        "currency": d.get("currency", "USD"),
-                        "reason": reason_cn,
-                        "customer_name": cust_name,
-                        "customer_email": cust_email,
-                        "evidence_due_date": evidence_due_date,
-                        "needs_response": needs_response,
-                        "is_refunded": is_refunded,
-                        "is_partially_refunded": is_partially_refunded,
-                        "refunded_amount": total_refunded,
-                        "last_refund_at": last_refund_at,
-                        "refund_count": refund_count,
-                        "order_tags": order_tags,
-                        "carrier": carrier,
-                        "tracking_number": tracking_number
-                    })
+                raw_dispute_items.extend(disputes)
 
                 link_header = response.headers.get("Link", "")
                 next_url = None
@@ -407,6 +354,77 @@ def fetch_disputes_for_shop(store, token_cache):
                             next_url = link.split(";")[0].strip("<> ")
                             break
                 url = next_url
+
+        # 店铺内部订单详情抓取引入并发池优化
+        if raw_dispute_items:
+            def process_single_dispute(d):
+                dispute_id = str(d["id"])
+                raw_type = str(d.get("type", "CHARGEBACK")).upper()
+                raw_status = str(d.get("status", "")).upper()
+                raw_reason = str(d.get("reason", "")).lower()
+
+                type_cn = TYPE_MAP.get(raw_type, raw_type)
+                status_cn = STATUS_MAP.get(raw_status, raw_status)
+                reason_cn = REASON_MAP.get(raw_reason, raw_reason if raw_reason else "未知原因")
+                
+                evidence_due_date = d.get("evidence_due_by", "") or "无"
+                unique_key = f"{shop_domain}|{dispute_id}"
+                order_id = d.get("order_id")
+                
+                (order_name, order_total, cust_name, cust_email, 
+                 refunds, order_tags, carrier, tracking_number) = get_order_details(
+                    session, shop_name, shop_domain, access_token, order_id, 
+                    evidence_due_date=evidence_due_date, raw_reason=raw_reason
+                 )
+                
+                refund_count = len(refunds)
+                is_refunded = "是" if refund_count > 0 else "否"
+                total_refunded = 0.0
+                last_refund_at = ""
+                for ref in refunds:
+                    for line_item in ref.get("refund_line_items", []):
+                        total_refunded += float(line_item.get("subtotal", 0.0))
+                    ref_time = ref.get("created_at", "")
+                    if ref_time > last_refund_at:
+                        last_refund_at = ref_time
+                        
+                is_partially_refunded = "是" if (0 < total_refunded < order_total) else "否"
+                needs_response = "是" if raw_status == "NEEDS_RESPONSE" else "否"
+                
+                return {
+                    "key": unique_key,
+                    "shop_name": shop_name,
+                    "shop_domain": shop_domain,
+                    "order_name": order_name,
+                    "order_amount": order_total,
+                    "dispute_id": dispute_id,
+                    "type": type_cn,
+                    "current_status": status_cn,
+                    "created_at": d.get("initiated_at", ""),
+                    "amount": str(d.get("amount", "0")),
+                    "currency": d.get("currency", "USD"),
+                    "reason": reason_cn,
+                    "customer_name": cust_name,
+                    "customer_email": cust_email,
+                    "evidence_due_date": evidence_due_date,
+                    "needs_response": needs_response,
+                    "is_refunded": is_refunded,
+                    "is_partially_refunded": is_partially_refunded,
+                    "refunded_amount": total_refunded,
+                    "last_refund_at": last_refund_at,
+                    "refund_count": refund_count,
+                    "order_tags": order_tags,
+                    "carrier": carrier,
+                    "tracking_number": tracking_number
+                }
+
+            with ThreadPoolExecutor(max_workers=MAX_ORDER_WORKERS) as order_executor:
+                futures = [order_executor.submit(process_single_dispute, item) for item in raw_dispute_items]
+                for future in as_completed(futures):
+                    try:
+                        parsed_disputes.append(future.result())
+                    except Exception as sub_e:
+                        print(f"[{shop_name}] 处理单条拒付解析异常: {sub_e}")
 
     except Exception as e:
         err_details = str(e)[:200]
@@ -439,7 +457,7 @@ def fetch_disputes_for_shop(store, token_cache):
     
     return parsed_disputes, sync_status, error_logs
 
-def post_to_gas(session, action, item_key, item_list, batch_size=30, max_retries=6):
+def post_to_gas(session, action, item_key, item_list, batch_size=100, max_retries=6):
     if not item_list:
         return
         
@@ -457,7 +475,7 @@ def post_to_gas(session, action, item_key, item_list, batch_size=30, max_retries
                 try:
                     res_json = res.json()
                     if res_json.get("status") == "success":
-                        print(f"[{action}] 批次 ({i+1}-{min(i+batch_size, total)}/{total}) 推送成功: {res.text}")
+                        print(f"[{action}] 批次 ({i+1}-{min(i+batch_size, total)}/{total}) 推送成功")
                         success = True
                         break
                     elif res_json.get("status") == "error" and "Lock timeout" in res_json.get("message", ""):
@@ -483,7 +501,7 @@ def post_to_gas(session, action, item_key, item_list, batch_size=30, max_retries
         if not success:
             print(f"❌ [{action}] 批次 ({i+1}-{min(i+batch_size, total)}/{total}) 经过 {max_retries} 次重试后仍然失败，请检查 GAS 后端限制！")
             
-        time.sleep(1)
+        time.sleep(0.5)
 
 def main():
     if not os.path.exists(STORES_JSON_PATH):
@@ -501,7 +519,7 @@ def main():
     all_sync_statuses = []
     all_error_logs = []
     
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+    with ThreadPoolExecutor(max_workers=MAX_STORE_WORKERS) as executor:
         future_to_store = {executor.submit(fetch_disputes_for_shop, store, token_cache): store for store in stores_config}
         for future in as_completed(future_to_store):
             disputes, sync_status, error_logs = future.result()
@@ -514,13 +532,13 @@ def main():
     session = get_session()
     
     if all_disputes:
-        post_to_gas(session, "SYNC_DISPUTES", "disputes", all_disputes, batch_size=30)
+        post_to_gas(session, "SYNC_DISPUTES", "disputes", all_disputes, batch_size=100)
         
     if all_sync_statuses:
-        post_to_gas(session, "UPDATE_SYNC_STATUS", "sync_status", all_sync_statuses, batch_size=50)
+        post_to_gas(session, "UPDATE_SYNC_STATUS", "sync_status", all_sync_statuses, batch_size=100)
         
     if all_error_logs:
-        post_to_gas(session, "LOG_ERROR", "error_logs", all_error_logs, batch_size=50)
+        post_to_gas(session, "LOG_ERROR", "error_logs", all_error_logs, batch_size=100)
 
 if __name__ == "__main__":
     main()
