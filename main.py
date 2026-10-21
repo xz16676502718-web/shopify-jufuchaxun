@@ -16,26 +16,18 @@ GAS_WEBHOOK_URL = "https://script.google.com/macros/s/AKfycbz5lkaskmNJRA_X0iL_QQ
 API_VERSION = "2026-01"
 
 # 核心性能配置
-MAX_STORE_WORKERS = 10  # 店铺级并发数
+MAX_STORE_WORKERS = 10  # 店铺级并发数（从 3 提升至 10）
 MAX_ORDER_WORKERS = 4   # 单店内部订单详情并发数
 
 FILE_LOCK = threading.Lock()
-ORDER_CACHE_LOCK = threading.Lock()
-ORDER_CACHE = {}  # 运行期订单详情缓存
 
 DISPUTE_TAG_PATTERN = re.compile(r'^(\d{1,2}\.\d{1,2})(?:截止)?-(.+)$')
-
-# 💡 智能纠偏覆盖字典：如果某些 API 英文原因与你们网页后台认知不符，可在此直接强制指定中文
-# 格式例： "api英文原词小写": "你希望显示的正统中文描述"
-REASON_OVERRIDE_MAP = {
-    # "product_unacceptable": "未收到产品",  # 如果你需要把这个强制转成未收到产品，取消左侧注释即可
-}
 
 SHORT_REASON_MAP = {
     "fraudulent": "欺诈",
     "product_not_received": "未收到产品",
     "product_unacceptable": "产品不可接受",
-    "unrecognized": "账户详细信息不正确",
+    "unrecognized": "账单无法识别",
     "credit_not_processed": "抵扣额未处理",
     "duplicate": "重复付款",
     "general": "通用",
@@ -64,6 +56,7 @@ STATUS_MAP = {
 
 def get_session():
     session = requests.Session()
+    # 增加连接池容量以适应更高并发
     adapter = requests.adapters.HTTPAdapter(pool_connections=20, pool_maxsize=20)
     session.mount("https://", adapter)
     return session
@@ -160,6 +153,135 @@ def process_order_tags(tags_list, target_date_str, target_reason_cn):
     
     return other_tags
 
+def process_order_tags_for_disputes(tags_list, dispute_items):
+    """按订单汇总所有拒付案件标签，避免同一订单的不同原因互相覆盖。"""
+    other_tags = []
+    suffixes_by_base = {}
+    all_suffixes = []
+
+    for tag in tags_list:
+        match = DISPUTE_TAG_PATTERN.match(str(tag).strip())
+        if not match:
+            other_tags.append(tag)
+            continue
+
+        date_part = match.group(1)
+        rest_parts = match.group(2).split("-")
+        # 标签原因本身采用现有中文短原因，不含连字符；其余部分为邮件等流程后缀。
+        base_tag = f"{date_part}-{rest_parts[0].strip()}"
+        suffixes = [s.strip() for s in rest_parts[1:] if s.strip()]
+        suffixes_by_base.setdefault(base_tag, [])
+        for suffix in suffixes:
+            if suffix not in suffixes_by_base[base_tag]:
+                suffixes_by_base[base_tag].append(suffix)
+            if suffix not in all_suffixes:
+                all_suffixes.append(suffix)
+
+    # 使用每个案件自己的截止日期和原始 reason，生成去重且顺序稳定的标签。
+    base_tags = []
+    for item in sorted(dispute_items, key=lambda x: str(x.get("_initiated_at", "")), reverse=True):
+        date_part = parse_dispute_date(item.get("_evidence_due_date", ""))
+        raw_reason = str(item.get("_raw_reason", "")).lower()
+        reason_short = SHORT_REASON_MAP.get(raw_reason, "其他")
+        base_tag = f"{date_part}-{reason_short}" if date_part else reason_short
+        if base_tag not in base_tags:
+            base_tags.append(base_tag)
+
+    if not base_tags:
+        return other_tags
+
+    result_dispute_tags = []
+    used_suffixes = set()
+
+    for base_tag in base_tags:
+        matching_suffixes = suffixes_by_base.get(base_tag, [])
+        if matching_suffixes:
+            used_suffixes.update(matching_suffixes)
+            result_dispute_tags.append(base_tag + "-" + "-".join(matching_suffixes))
+        else:
+            result_dispute_tags.append(base_tag)
+
+    # 单案件时保持旧标签行为；多案件时将无法可靠归属到某一案件的旧后缀独立保留，
+    # 不再把其他案件的后缀拼到某个拒付原因标签上。
+    if len(base_tags) == 1:
+        for suffix in all_suffixes:
+            if suffix not in used_suffixes:
+                result_dispute_tags[0] += "-" + suffix
+                used_suffixes.add(suffix)
+    else:
+        for suffix in all_suffixes:
+            if suffix not in used_suffixes and suffix not in other_tags and suffix not in result_dispute_tags:
+                other_tags.append(suffix)
+
+    return other_tags + result_dispute_tags
+
+
+def sync_order_tags_for_disputes(session, shop_name, shop_domain, access_token, disputes):
+    """按店铺+订单聚合案件，只对每个订单写回一次标签。"""
+    grouped = {}
+    for item in disputes:
+        order_id = item.get("_order_id")
+        if order_id:
+            grouped.setdefault(str(order_id), []).append(item)
+
+    for order_id, items in grouped.items():
+        url = f"https://{shop_domain}/admin/api/{API_VERSION}/orders/{order_id}.json?fields=id,name,tags"
+        headers = {"X-Shopify-Access-Token": access_token}
+        try:
+            response = safe_request(session, "GET", url, headers=headers)
+            if not response or response.status_code != 200:
+                status_code = response.status_code if response else "无响应"
+                print(f"⚠️ [{shop_name}] 订单 {order_id} 读取标签失败，HTTP {status_code}；跳过标签写回")
+                continue
+
+            order_data = response.json().get("order", {})
+            order_name = order_data.get("name", items[0].get("order_name", "N/A"))
+            raw_tags = order_data.get("tags", "") or ""
+            tags_list = [tag.strip() for tag in raw_tags.split(",") if tag.strip()]
+            new_tags_list = process_order_tags_for_disputes(tags_list, items)
+
+            if set(new_tags_list) != set(tags_list):
+                update_url = f"https://{shop_domain}/admin/api/{API_VERSION}/orders/{order_id}.json"
+                update_headers = {
+                    "X-Shopify-Access-Token": access_token,
+                    "Content-Type": "application/json",
+                }
+                payload = {"order": {"id": order_id, "tags": ", ".join(new_tags_list)}}
+                update_response = safe_request(
+                    session, "PUT", update_url, headers=update_headers, json=payload
+                )
+                if not update_response or update_response.status_code != 200:
+                    status_code = update_response.status_code if update_response else "无响应"
+                    print(f"⚠️ [{shop_name}] 订单 {order_name} 标签写回失败，HTTP {status_code}")
+                    new_tags_list = tags_list
+                else:
+                    print(
+                        f"***{shop_name}*** 订单 {order_name} 标签已按案件汇总更新为: "
+                        f"{', '.join(new_tags_list)}"
+                    )
+            else:
+                # Shopify 上的标签集合已正确，无需为顺序差异重复写回。
+                new_tags_list = tags_list
+
+            formatted_tags = "\n".join(new_tags_list)
+            for item in items:
+                item["order_tags"] = formatted_tags
+                print(
+                    f"[拒付原因核对] 店铺={shop_name} 案件ID={item.get('dispute_id')} "
+                    f"订单={order_name} 原因码={item.get('_raw_reason')!r} "
+                    f"表格原因={item.get('reason')!r}"
+                )
+        except Exception as exc:
+            print(f"⚠️ [{shop_name}] 订单 {order_id} 标签汇总更新异常: {exc}")
+
+    # 仅保留对 GAS 有用的业务字段，内部排错字段不推送。
+    for item in disputes:
+        item.pop("_order_id", None)
+        item.pop("_raw_reason", None)
+        item.pop("_evidence_due_date", None)
+        item.pop("_initiated_at", None)
+
+
 def load_token_cache():
     if os.path.exists(TOKEN_CACHE_FILE):
         try:
@@ -207,14 +329,9 @@ def get_access_token(session, store, cache):
     return None
 
 def get_order_details(session, shop_name, shop_domain, access_token, order_id, evidence_due_date="", raw_reason=""):
+    """只读取订单信息，不在并发案件线程里修改订单标签。"""
     if not order_id:
         return "N/A", 0.0, "N/A", "N/A", [], "", "无", "无"
-    
-    # 🚀 修复点：将 raw_reason 和 evidence_due_date 加入缓存 Key，确保不同拒付原因各自独立，绝不互相污染
-    cache_key = f"{shop_domain}|{order_id}|{raw_reason}|{evidence_due_date}"
-    with ORDER_CACHE_LOCK:
-        if cache_key in ORDER_CACHE:
-            return ORDER_CACHE[cache_key]
 
     url = f"https://{shop_domain}/admin/api/{API_VERSION}/orders/{order_id}.json?fields=id,name,total_price,total_price_set,customer,refunds,tags,fulfillments"
     headers = {"X-Shopify-Access-Token": access_token}
@@ -223,7 +340,7 @@ def get_order_details(session, shop_name, shop_domain, access_token, order_id, e
         if res and res.status_code == 200:
             ord_data = res.json().get("order", {})
             order_name = ord_data.get("name", "N/A")
-            
+
             price_set = ord_data.get("total_price_set") or {}
             presentment_money = price_set.get("presentment_money") or {}
             if "amount" in presentment_money and presentment_money.get("amount") is not None:
@@ -233,63 +350,39 @@ def get_order_details(session, shop_name, shop_domain, access_token, order_id, e
 
             cust = ord_data.get("customer") or {}
             cust_name = f"{cust.get('first_name', '')} {cust.get('last_name', '')}".strip() or "N/A"
-            cust_email = cust.get('email', '') or "N/A"
+            cust_email = cust.get("email", "") or "N/A"
             refunds = ord_data.get("refunds", [])
-            
-            raw_tags = ord_data.get("tags", "")
-            tags_list = [t.strip() for t in raw_tags.split(",") if t.strip()] if raw_tags else []
-            
-            tag_date_str = parse_dispute_date(evidence_due_date)
-            
-            # 💡 优先从覆盖字典取值，若无则走标准映射
-            raw_reason_lower = str(raw_reason).lower()
-            if raw_reason_lower in REASON_OVERRIDE_MAP:
-                target_reason_cn = REASON_OVERRIDE_MAP[raw_reason_lower]
-            else:
-                target_reason_cn = SHORT_REASON_MAP.get(raw_reason_lower, "其他")
-            
-            new_tags_list = process_order_tags(tags_list, tag_date_str, target_reason_cn)
-            
-            if set(new_tags_list) != set(tags_list):
-                new_tags_str = ", ".join(new_tags_list)
-                update_url = f"https://{shop_domain}/admin/api/{API_VERSION}/orders/{order_id}.json"
-                update_headers = {"X-Shopify-Access-Token": access_token, "Content-Type": "application/json"}
-                update_payload = {"order": {"id": order_id, "tags": new_tags_str}}
-                
-                update_res = safe_request(session, "PUT", update_url, headers=update_headers, json=update_payload)
-                if update_res and update_res.status_code == 200:
-                    tags_list = new_tags_list
-                    print(f"***{shop_name}*** 订单 {order_name} 标签已更正更新为: {new_tags_str}")
 
+            raw_tags = ord_data.get("tags", "") or ""
+            tags_list = [tag.strip() for tag in raw_tags.split(",") if tag.strip()]
             formatted_tags = "\n".join(tags_list)
-            
+
             fulfillments = ord_data.get("fulfillments", [])
             carriers = []
             tracking_numbers = []
-            
-            for f in fulfillments:
-                company = f.get("tracking_company")
+            for fulfillment in fulfillments:
+                company = fulfillment.get("tracking_company")
                 if company and str(company).strip() not in carriers:
                     carriers.append(str(company).strip())
-                
-                t_num = f.get("tracking_number")
-                if t_num and str(t_num).strip() not in tracking_numbers:
-                    tracking_numbers.append(str(t_num).strip())
-                for num in f.get("tracking_numbers") or []:
-                    n_str = str(num).strip()
-                    if n_str and n_str not in tracking_numbers:
-                        tracking_numbers.append(n_str)
-                        
+
+                tracking_number = fulfillment.get("tracking_number")
+                if tracking_number and str(tracking_number).strip() not in tracking_numbers:
+                    tracking_numbers.append(str(tracking_number).strip())
+                for number in fulfillment.get("tracking_numbers") or []:
+                    number_str = str(number).strip()
+                    if number_str and number_str not in tracking_numbers:
+                        tracking_numbers.append(number_str)
+
             carrier_str = "\n".join(carriers) if carriers else "无"
             tracking_str = "\n".join(tracking_numbers) if tracking_numbers else "无"
-            
-            result = (order_name, order_total, cust_name, cust_email, refunds, formatted_tags, carrier_str, tracking_str)
-            with ORDER_CACHE_LOCK:
-                ORDER_CACHE[cache_key] = result
-            return result
-    except Exception as e:
-        print(f"[{shop_name}] 获取订单 {order_id} 详情异常: {e}")
-        
+            return (order_name, order_total, cust_name, cust_email, refunds,
+                    formatted_tags, carrier_str, tracking_str)
+
+        if res:
+            print(f"⚠️ [{shop_name}] 获取订单 {order_id} 详情失败，HTTP {res.status_code}: {res.text[:200]}")
+    except Exception as exc:
+        print(f"[{shop_name}] 获取订单 {order_id} 详情异常: {exc}")
+
     return "N/A", 0.0, "N/A", "N/A", [], "", "无", "无"
 
 def fetch_disputes_for_shop(store, token_cache):
@@ -367,6 +460,7 @@ def fetch_disputes_for_shop(store, token_cache):
                             break
                 url = next_url
 
+        # 店铺内部订单详情抓取引入并发池优化
         if raw_dispute_items:
             def process_single_dispute(d):
                 dispute_id = str(d["id"])
@@ -376,12 +470,7 @@ def fetch_disputes_for_shop(store, token_cache):
 
                 type_cn = TYPE_MAP.get(raw_type, raw_type)
                 status_cn = STATUS_MAP.get(raw_status, raw_status)
-                
-                # 💡 表格中的原因也应用智能覆盖规则
-                if raw_reason in REASON_OVERRIDE_MAP:
-                    reason_cn = REASON_OVERRIDE_MAP[raw_reason]
-                else:
-                    reason_cn = REASON_MAP.get(raw_reason, raw_reason if raw_reason else "未知原因")
+                reason_cn = REASON_MAP.get(raw_reason, raw_reason if raw_reason else "未知原因")
                 
                 evidence_due_date = d.get("evidence_due_by", "") or "无"
                 unique_key = f"{shop_domain}|{dispute_id}"
@@ -431,7 +520,11 @@ def fetch_disputes_for_shop(store, token_cache):
                     "refund_count": refund_count,
                     "order_tags": order_tags,
                     "carrier": carrier,
-                    "tracking_number": tracking_number
+                    "tracking_number": tracking_number,
+                    "_order_id": order_id,
+                    "_raw_reason": raw_reason,
+                    "_evidence_due_date": evidence_due_date,
+                    "_initiated_at": d.get("initiated_at", "")
                 }
 
             with ThreadPoolExecutor(max_workers=MAX_ORDER_WORKERS) as order_executor:
@@ -441,6 +534,9 @@ def fetch_disputes_for_shop(store, token_cache):
                         parsed_disputes.append(future.result())
                     except Exception as sub_e:
                         print(f"[{shop_name}] 处理单条拒付解析异常: {sub_e}")
+
+            # 先独立解析每条案件，再按订单聚合标签；避免同订单多个案件并发覆盖。
+            sync_order_tags_for_disputes(session, shop_name, shop_domain, access_token, parsed_disputes)
 
     except Exception as e:
         err_details = str(e)[:200]
@@ -473,7 +569,7 @@ def fetch_disputes_for_shop(store, token_cache):
     
     return parsed_disputes, sync_status, error_logs
 
-def post_to_gas(session, action, item_key, item_list, batch_size=500, max_retries=6):
+def post_to_gas(session, action, item_key, item_list, batch_size=500, max_retries=6):  # 🚀 批次大小提升至 500
     if not item_list:
         return
         
@@ -486,6 +582,7 @@ def post_to_gas(session, action, item_key, item_list, batch_size=500, max_retrie
         success = False
         
         for attempt in range(1, max_retries + 1):
+            # 🚀 单批次变大，适当放宽超时时间到 90 秒
             res = safe_request(session, "POST", GAS_WEBHOOK_URL, json=payload, headers=headers, timeout=(10, 90))
             if res and res.status_code == 200:
                 try:
@@ -517,7 +614,7 @@ def post_to_gas(session, action, item_key, item_list, batch_size=500, max_retrie
         if not success:
             print(f"❌ [{action}] 批次 ({i+1}-{min(i+batch_size, total)}/{total}) 经过 {max_retries} 次重试后仍然失败，请检查 GAS 后端限制！")
             
-        time.sleep(0.1)
+        time.sleep(0.1)  # 🚀 将批次间歇缩短至 0.1 秒，大幅提速
 
 def main():
     if not os.path.exists(STORES_JSON_PATH):
@@ -554,7 +651,7 @@ def main():
         post_to_gas(session, "UPDATE_SYNC_STATUS", "sync_status", all_sync_statuses, batch_size=500)
         
     if all_error_logs:
-        post_to_gas(session, "LOG_ERROR", "error_logs", all_error_logs, batch_size=100)
+        post_to_gas(session, "LOG_ERROR", "error_logs", all_error_logs, batch_size=500)
 
 if __name__ == "__main__":
     main()
