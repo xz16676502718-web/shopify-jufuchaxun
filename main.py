@@ -210,7 +210,8 @@ def get_order_details(session, shop_name, shop_domain, access_token, order_id, e
     if not order_id:
         return "N/A", 0.0, "N/A", "N/A", [], "", "无", "无"
     
-    cache_key = f"{shop_domain}|{order_id}"
+    # 🚀 修复点：将 raw_reason 和 evidence_due_date 加入缓存 Key，确保不同拒付原因各自独立，绝不互相污染
+    cache_key = f"{shop_domain}|{order_id}|{raw_reason}|{evidence_due_date}"
     with ORDER_CACHE_LOCK:
         if cache_key in ORDER_CACHE:
             return ORDER_CACHE[cache_key]
