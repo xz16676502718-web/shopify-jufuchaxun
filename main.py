@@ -457,7 +457,7 @@ def fetch_disputes_for_shop(store, token_cache):
     
     return parsed_disputes, sync_status, error_logs
 
-def post_to_gas(session, action, item_key, item_list, batch_size=100, max_retries=6):
+def post_to_gas(session, action, item_key, item_list, batch_size=500, max_retries=6):  # 🚀 批次大小提升至 500
     if not item_list:
         return
         
@@ -470,7 +470,8 @@ def post_to_gas(session, action, item_key, item_list, batch_size=100, max_retrie
         success = False
         
         for attempt in range(1, max_retries + 1):
-            res = safe_request(session, "POST", GAS_WEBHOOK_URL, json=payload, headers=headers, timeout=(10, 60))
+            # 🚀 单批次变大，适当放宽超时时间到 90 秒
+            res = safe_request(session, "POST", GAS_WEBHOOK_URL, json=payload, headers=headers, timeout=(10, 90))
             if res and res.status_code == 200:
                 try:
                     res_json = res.json()
@@ -501,7 +502,7 @@ def post_to_gas(session, action, item_key, item_list, batch_size=100, max_retrie
         if not success:
             print(f"❌ [{action}] 批次 ({i+1}-{min(i+batch_size, total)}/{total}) 经过 {max_retries} 次重试后仍然失败，请检查 GAS 后端限制！")
             
-        time.sleep(0.5)
+        time.sleep(0.1)  # 🚀 将批次间歇缩短至 0.1 秒，大幅提速
 
 def main():
     if not os.path.exists(STORES_JSON_PATH):
@@ -532,13 +533,13 @@ def main():
     session = get_session()
     
     if all_disputes:
-        post_to_gas(session, "SYNC_DISPUTES", "disputes", all_disputes, batch_size=100)
+        post_to_gas(session, "SYNC_DISPUTES", "disputes", all_disputes, batch_size=500)
         
     if all_sync_statuses:
-        post_to_gas(session, "UPDATE_SYNC_STATUS", "sync_status", all_sync_statuses, batch_size=100)
+        post_to_gas(session, "UPDATE_SYNC_STATUS", "sync_status", all_sync_statuses, batch_size=500)
         
     if all_error_logs:
-        post_to_gas(session, "LOG_ERROR", "error_logs", all_error_logs, batch_size=100)
+        post_to_gas(session, "LOG_ERROR", "error_logs", all_error_logs, batch_size=500)
 
 if __name__ == "__main__":
     main()
