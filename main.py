@@ -16,7 +16,7 @@ GAS_WEBHOOK_URL = "https://script.google.com/macros/s/AKfycbz5lkaskmNJRA_X0iL_QQ
 API_VERSION = "2026-01"
 
 # 核心性能配置
-MAX_STORE_WORKERS = 10  # 店铺级并发数（从 3 提升至 10）
+MAX_STORE_WORKERS = 10  # 店铺级并发数
 MAX_ORDER_WORKERS = 4   # 单店内部订单详情并发数
 
 FILE_LOCK = threading.Lock()
@@ -24,6 +24,12 @@ ORDER_CACHE_LOCK = threading.Lock()
 ORDER_CACHE = {}  # 运行期订单详情缓存
 
 DISPUTE_TAG_PATTERN = re.compile(r'^(\d{1,2}\.\d{1,2})(?:截止)?-(.+)$')
+
+# 💡 智能纠偏覆盖字典：如果某些 API 英文原因与你们网页后台认知不符，可在此直接强制指定中文
+# 格式例： "api英文原词小写": "你希望显示的正统中文描述"
+REASON_OVERRIDE_MAP = {
+    # "product_unacceptable": "未收到产品",  # 如果你需要把这个强制转成未收到产品，取消左侧注释即可
+}
 
 SHORT_REASON_MAP = {
     "fraudulent": "欺诈",
@@ -58,7 +64,6 @@ STATUS_MAP = {
 
 def get_session():
     session = requests.Session()
-    # 增加连接池容量以适应更高并发
     adapter = requests.adapters.HTTPAdapter(pool_connections=20, pool_maxsize=20)
     session.mount("https://", adapter)
     return session
@@ -234,7 +239,13 @@ def get_order_details(session, shop_name, shop_domain, access_token, order_id, e
             tags_list = [t.strip() for t in raw_tags.split(",") if t.strip()] if raw_tags else []
             
             tag_date_str = parse_dispute_date(evidence_due_date)
-            target_reason_cn = SHORT_REASON_MAP.get(str(raw_reason).lower(), "其他")
+            
+            # 💡 优先从覆盖字典取值，若无则走标准映射
+            raw_reason_lower = str(raw_reason).lower()
+            if raw_reason_lower in REASON_OVERRIDE_MAP:
+                target_reason_cn = REASON_OVERRIDE_MAP[raw_reason_lower]
+            else:
+                target_reason_cn = SHORT_REASON_MAP.get(raw_reason_lower, "其他")
             
             new_tags_list = process_order_tags(tags_list, tag_date_str, target_reason_cn)
             
@@ -355,7 +366,6 @@ def fetch_disputes_for_shop(store, token_cache):
                             break
                 url = next_url
 
-        # 店铺内部订单详情抓取引入并发池优化
         if raw_dispute_items:
             def process_single_dispute(d):
                 dispute_id = str(d["id"])
@@ -365,7 +375,12 @@ def fetch_disputes_for_shop(store, token_cache):
 
                 type_cn = TYPE_MAP.get(raw_type, raw_type)
                 status_cn = STATUS_MAP.get(raw_status, raw_status)
-                reason_cn = REASON_MAP.get(raw_reason, raw_reason if raw_reason else "未知原因")
+                
+                # 💡 表格中的原因也应用智能覆盖规则
+                if raw_reason in REASON_OVERRIDE_MAP:
+                    reason_cn = REASON_OVERRIDE_MAP[raw_reason]
+                else:
+                    reason_cn = REASON_MAP.get(raw_reason, raw_reason if raw_reason else "未知原因")
                 
                 evidence_due_date = d.get("evidence_due_by", "") or "无"
                 unique_key = f"{shop_domain}|{dispute_id}"
@@ -457,7 +472,7 @@ def fetch_disputes_for_shop(store, token_cache):
     
     return parsed_disputes, sync_status, error_logs
 
-def post_to_gas(session, action, item_key, item_list, batch_size=500, max_retries=6):  # 🚀 批次大小提升至 500
+def post_to_gas(session, action, item_key, item_list, batch_size=500, max_retries=6):
     if not item_list:
         return
         
@@ -470,7 +485,6 @@ def post_to_gas(session, action, item_key, item_list, batch_size=500, max_retrie
         success = False
         
         for attempt in range(1, max_retries + 1):
-            # 🚀 单批次变大，适当放宽超时时间到 90 秒
             res = safe_request(session, "POST", GAS_WEBHOOK_URL, json=payload, headers=headers, timeout=(10, 90))
             if res and res.status_code == 200:
                 try:
@@ -502,7 +516,7 @@ def post_to_gas(session, action, item_key, item_list, batch_size=500, max_retrie
         if not success:
             print(f"❌ [{action}] 批次 ({i+1}-{min(i+batch_size, total)}/{total}) 经过 {max_retries} 次重试后仍然失败，请检查 GAS 后端限制！")
             
-        time.sleep(0.1)  # 🚀 将批次间歇缩短至 0.1 秒，大幅提速
+        time.sleep(0.1)
 
 def main():
     if not os.path.exists(STORES_JSON_PATH):
@@ -539,7 +553,7 @@ def main():
         post_to_gas(session, "UPDATE_SYNC_STATUS", "sync_status", all_sync_statuses, batch_size=500)
         
     if all_error_logs:
-        post_to_gas(session, "LOG_ERROR", "error_logs", all_error_logs, batch_size=500)
+        post_to_gas(session, "LOG_ERROR", "error_logs", all_error_logs, batch_size=100)
 
 if __name__ == "__main__":
     main()
