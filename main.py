@@ -20,6 +20,8 @@ MAX_STORE_WORKERS = 10  # 店铺级并发数（从 3 提升至 10）
 MAX_ORDER_WORKERS = 4   # 单店内部订单详情并发数
 
 FILE_LOCK = threading.Lock()
+# 本次截图对应的案件：即使 REST 与 GraphQL 返回相同，也记录两边原始原因便于核验。
+REASON_AUDIT_TARGET_IDS = {"15997534549"}
 
 DISPUTE_TAG_PATTERN = re.compile(r'^(\d{1,2}\.\d{1,2})(?:截止)?-(.+)$')
 
@@ -32,7 +34,13 @@ SHORT_REASON_MAP = {
     "duplicate": "重复付款",
     "general": "通用",
     "subscription_canceled": "订阅已取消",
-    "canceled": "其他"
+    "canceled": "订单已取消",
+    "bank_not_process": "银行无法处理",
+    "customer_initiated": "客户主动发起",
+    "debit_not_authorized": "扣款未获授权",
+    "incorrect_account_details": "账户信息不正确",
+    "insufficient_funds": "资金不足",
+    "noncompliant": "不符合卡组织规则",
 }
 
 REASON_MAP = {
@@ -42,10 +50,133 @@ REASON_MAP = {
     "unrecognized": "账单无法识别",
     "credit_not_processed": "抵扣额未处理",
     "duplicate": "重复扣款",
-    "general": "常规原因/其他",
+    "general": "通用",
     "subscription_canceled": "订阅已被取消",
-    "canceled": "订单已被取消"
+    "canceled": "订单已取消",
+    "bank_not_process": "银行无法处理此笔交易",
+    "customer_initiated": "客户主动发起争议",
+    "debit_not_authorized": "扣款未获授权",
+    "incorrect_account_details": "账户详细信息不正确",
+    "insufficient_funds": "账户资金不足",
+    "noncompliant": "不符合卡组织规则",
 }
+
+# GraphQL and REST use slightly different enum spellings for a few reasons.
+def normalize_reason_code(value):
+    value = str(value or "").strip().lower()
+    aliases = {
+        "bank_cannot_process": "bank_not_process",
+        "subscription_cancelled": "subscription_canceled",
+    }
+    return aliases.get(value, value)
+
+
+def fetch_graphql_dispute_reasons(session, shop_domain, access_token):
+    """Fetch canonical dispute reasons from GraphQL, keyed by REST legacyResourceId.
+
+    Fail closed: if GraphQL is unavailable or does not cover all REST cases, caller
+    must not sync possibly incorrect REST reasons into the sheet or order tags.
+    """
+    endpoint = f"https://{shop_domain}/admin/api/{API_VERSION}/graphql.json"
+    headers = {
+        "X-Shopify-Access-Token": access_token,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    query = """
+    query DisputeReasonAudit($first: Int!, $after: String) {
+      disputes(first: $first, after: $after) {
+        edges {
+          cursor
+          node {
+            legacyResourceId
+            reasonDetails {
+              reason
+              networkReasonCode
+            }
+          }
+        }
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+      }
+    }
+    """
+    result = {}
+    cursor = None
+    while True:
+        response = safe_request(
+            session, "POST", endpoint, headers=headers,
+            json={"query": query, "variables": {"first": 250, "after": cursor}},
+            timeout=(10, 45),
+        )
+        if not response or response.status_code != 200:
+            status = response.status_code if response else 0
+            body = response.text[:500] if response else "无响应"
+            scope_hint = "；请确认该应用已获 read_shopify_payments_disputes 权限并重新授权" if status in (401, 403) else ""
+            raise RuntimeError(f"GraphQL 拒付原因查询失败 HTTP {status}: {body}{scope_hint}")
+
+        try:
+            payload = response.json()
+        except Exception as exc:
+            raise RuntimeError(f"GraphQL 返回非 JSON 响应: {exc}")
+
+        if payload.get("errors"):
+            error_text = json.dumps(payload["errors"], ensure_ascii=False)[:700]
+            raise RuntimeError(
+                "GraphQL 拒付原因查询返回 errors: " + error_text +
+                "；请检查 read_shopify_payments_disputes API 权限、重新授权及 API 版本"
+            )
+
+        connection = (payload.get("data") or {}).get("disputes")
+        if not isinstance(connection, dict):
+            raise RuntimeError("GraphQL 响应缺少 data.disputes，不能验证案件原因")
+
+        for edge in connection.get("edges") or []:
+            node = edge.get("node") or {}
+            legacy_id = str(node.get("legacyResourceId") or "").strip()
+            reason_details = node.get("reasonDetails") or {}
+            reason = normalize_reason_code(reason_details.get("reason"))
+            if legacy_id and reason:
+                result[legacy_id] = {
+                    "reason": reason,
+                    "network_reason_code": str(reason_details.get("networkReasonCode") or "").strip(),
+                }
+
+        page_info = connection.get("pageInfo") or {}
+        if not page_info.get("hasNextPage"):
+            break
+        next_cursor = page_info.get("endCursor")
+        if not next_cursor or next_cursor == cursor:
+            raise RuntimeError("GraphQL 分页异常：hasNextPage=true，但 endCursor 缺失或未变化")
+        cursor = next_cursor
+
+    if not result:
+        raise RuntimeError("GraphQL 未返回任何拒付原因，拒绝使用未经核验的 REST reason")
+    return result
+
+
+def log_reason_mismatch(shop_name, shop_domain, dispute_item, rest_reason, graphql_reason, network_code):
+    """Print and persist REST-vs-GraphQL reason discrepancies for later diagnosis."""
+    entry = {
+        "time_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+        "shop_name": shop_name,
+        "shop_domain": shop_domain,
+        "dispute_id": str(dispute_item.get("id", "")),
+        "order_id": str(dispute_item.get("order_id", "")),
+        "rest_reason": rest_reason,
+        "graphql_reason": graphql_reason,
+        "network_reason_code": network_code,
+        "selected_reason": graphql_reason,
+    }
+    print("⚠️ [拒付原因源不一致] " + json.dumps(entry, ensure_ascii=False))
+    try:
+        with FILE_LOCK:
+            with open("dispute_reason_audit.jsonl", "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception as exc:
+        print(f"⚠️ 原因差异日志写入失败: {exc}")
 
 TYPE_MAP = {"CHARGEBACK": "拒付", "INQUIRY": "调单/问询"}
 STATUS_MAP = {
@@ -308,8 +439,13 @@ def get_access_token(session, store, cache):
     client_secret = store["client_secret"]
     shop_name = store.get("name", domain)
 
-    if domain in cache and "access_token" in cache[domain]:
-        return cache[domain]["access_token"]
+    # Client Credentials access tokens expire after expires_in (normally 24 hours).
+    # Old cache entries without expires_at are intentionally refreshed once.
+    cached = cache.get(domain) or {}
+    cached_token = cached.get("access_token")
+    expires_at = float(cached.get("expires_at", 0) or 0)
+    if cached_token and expires_at > time.time() + 300:
+        return cached_token
 
     token_url = f"https://{domain}/admin/oauth/access_token"
     payload = {"client_id": client_id, "client_secret": client_secret, "grant_type": "client_credentials"}
@@ -320,7 +456,11 @@ def get_access_token(session, store, cache):
             token_data = resp.json()
             access_token = token_data.get("access_token")
             if access_token:
-                cache[domain] = {"access_token": access_token}
+                expires_in = int(token_data.get("expires_in", 86399) or 86399)
+                cache[domain] = {
+                    "access_token": access_token,
+                    "expires_at": time.time() + expires_in,
+                }
                 save_token_cache(cache)
                 return access_token
     except Exception as e:
@@ -460,13 +600,44 @@ def fetch_disputes_for_shop(store, token_cache):
                             break
                 url = next_url
 
+        # 用 GraphQL reasonDetails.reason 交叉核验 REST 列表 reason。
+        # 任一案件无法由 GraphQL 对上时，整个店铺本轮停止写入，避免把错因继续传播。
+        if raw_dispute_items:
+            graphql_reasons = fetch_graphql_dispute_reasons(session, shop_domain, access_token)
+            missing_ids = [str(item.get("id", "")) for item in raw_dispute_items
+                           if str(item.get("id", "")) not in graphql_reasons]
+            missing_reasons = [str(item.get("id", "")) for item in raw_dispute_items
+                               if str(item.get("id", "")) in graphql_reasons
+                               and not graphql_reasons[str(item.get("id", ""))].get("reason")]
+            if missing_ids or missing_reasons:
+                sample = (missing_ids + missing_reasons)[:20]
+                raise RuntimeError(
+                    "GraphQL 拒付案件与 REST 列表未能完整匹配；为避免错误原因写入，本店本轮不做同步。"
+                    f"缺失/无原因案件ID示例: {sample}。请确认 GraphQL 权限及 API 数据完整性。"
+                )
+
+            for dispute_item in raw_dispute_items:
+                dispute_id_for_reason = str(dispute_item.get("id", ""))
+                rest_reason = normalize_reason_code(dispute_item.get("reason"))
+                canonical = graphql_reasons[dispute_id_for_reason]
+                graphql_reason = canonical["reason"]
+                network_code = canonical.get("network_reason_code", "")
+                if (rest_reason and rest_reason != graphql_reason) or dispute_id_for_reason in REASON_AUDIT_TARGET_IDS:
+                    log_reason_mismatch(
+                        shop_name, shop_domain, dispute_item,
+                        rest_reason, graphql_reason, network_code
+                    )
+                dispute_item["_rest_reason"] = rest_reason
+                dispute_item["reason"] = graphql_reason
+                dispute_item["network_reason_code"] = network_code
+
         # 店铺内部订单详情抓取引入并发池优化
         if raw_dispute_items:
             def process_single_dispute(d):
                 dispute_id = str(d["id"])
                 raw_type = str(d.get("type", "CHARGEBACK")).upper()
                 raw_status = str(d.get("status", "")).upper()
-                raw_reason = str(d.get("reason", "")).lower()
+                raw_reason = normalize_reason_code(d.get("reason", ""))
 
                 type_cn = TYPE_MAP.get(raw_type, raw_type)
                 status_cn = STATUS_MAP.get(raw_status, raw_status)
@@ -523,6 +694,8 @@ def fetch_disputes_for_shop(store, token_cache):
                     "tracking_number": tracking_number,
                     "_order_id": order_id,
                     "_raw_reason": raw_reason,
+                    "_network_reason_code": str(d.get("network_reason_code", "") or ""),
+                    "_rest_reason": str(d.get("_rest_reason", "") or ""),
                     "_evidence_due_date": evidence_due_date,
                     "_initiated_at": d.get("initiated_at", "")
                 }
