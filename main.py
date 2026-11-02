@@ -6,6 +6,7 @@ import threading
 import requests
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from decimal import Decimal, InvalidOperation
 
 # ==================== 配置区 ====================
 STORES_JSON_PATH = "stores.json"
@@ -71,11 +72,11 @@ def normalize_reason_code(value):
     return aliases.get(value, value)
 
 
-def fetch_graphql_dispute_reasons(session, shop_domain, access_token):
-    """Fetch canonical dispute reasons from GraphQL, keyed by REST legacyResourceId.
+def fetch_graphql_dispute_details(session, shop_domain, access_token):
+    """Fetch canonical reason/type/status from GraphQL, keyed by REST legacyResourceId.
 
-    Fail closed: if GraphQL is unavailable or does not cover all REST cases, caller
-    must not sync possibly incorrect REST reasons into the sheet or order tags.
+    GraphQL is treated as the authoritative source for dispute type and status.
+    Fail closed if any REST dispute cannot be matched or lacks required fields.
     """
     endpoint = f"https://{shop_domain}/admin/api/{API_VERSION}/graphql.json"
     headers = {
@@ -84,12 +85,15 @@ def fetch_graphql_dispute_reasons(session, shop_domain, access_token):
         "Accept": "application/json",
     }
     query = """
-    query DisputeReasonAudit($first: Int!, $after: String) {
+    query DisputeAudit($first: Int!, $after: String) {
       disputes(first: $first, after: $after) {
         edges {
           cursor
           node {
             legacyResourceId
+            type
+            status
+            finalizedOn
             reasonDetails {
               reason
               networkReasonCode
@@ -103,6 +107,7 @@ def fetch_graphql_dispute_reasons(session, shop_domain, access_token):
       }
     }
     """
+
     result = {}
     cursor = None
     while True:
@@ -115,7 +120,7 @@ def fetch_graphql_dispute_reasons(session, shop_domain, access_token):
             status = response.status_code if response else 0
             body = response.text[:500] if response else "无响应"
             scope_hint = "；请确认该应用已获 read_shopify_payments_disputes 权限并重新授权" if status in (401, 403) else ""
-            raise RuntimeError(f"GraphQL 拒付原因查询失败 HTTP {status}: {body}{scope_hint}")
+            raise RuntimeError(f"GraphQL 拒付案件详情查询失败 HTTP {status}: {body}{scope_hint}")
 
         try:
             payload = response.json()
@@ -125,23 +130,28 @@ def fetch_graphql_dispute_reasons(session, shop_domain, access_token):
         if payload.get("errors"):
             error_text = json.dumps(payload["errors"], ensure_ascii=False)[:700]
             raise RuntimeError(
-                "GraphQL 拒付原因查询返回 errors: " + error_text +
+                "GraphQL 拒付案件详情查询返回 errors: " + error_text +
                 "；请检查 read_shopify_payments_disputes API 权限、重新授权及 API 版本"
             )
 
         connection = (payload.get("data") or {}).get("disputes")
         if not isinstance(connection, dict):
-            raise RuntimeError("GraphQL 响应缺少 data.disputes，不能验证案件原因")
+            raise RuntimeError("GraphQL 响应缺少 data.disputes，不能核验案件类型和状态")
 
         for edge in connection.get("edges") or []:
             node = edge.get("node") or {}
             legacy_id = str(node.get("legacyResourceId") or "").strip()
             reason_details = node.get("reasonDetails") or {}
             reason = normalize_reason_code(reason_details.get("reason"))
-            if legacy_id and reason:
+            dispute_type = str(node.get("type") or "").strip().upper()
+            dispute_status = str(node.get("status") or "").strip().upper()
+            if legacy_id:
                 result[legacy_id] = {
                     "reason": reason,
                     "network_reason_code": str(reason_details.get("networkReasonCode") or "").strip(),
+                    "type": dispute_type,
+                    "status": dispute_status,
+                    "finalized_on": str(node.get("finalizedOn") or "").strip(),
                 }
 
         page_info = connection.get("pageInfo") or {}
@@ -153,7 +163,7 @@ def fetch_graphql_dispute_reasons(session, shop_domain, access_token):
         cursor = next_cursor
 
     if not result:
-        raise RuntimeError("GraphQL 未返回任何拒付原因，拒绝使用未经核验的 REST reason")
+        raise RuntimeError("GraphQL 未返回任何拒付案件详情，拒绝使用未经核验的 REST 数据")
     return result
 
 
@@ -178,12 +188,72 @@ def log_reason_mismatch(shop_name, shop_domain, dispute_item, rest_reason, graph
     except Exception as exc:
         print(f"⚠️ 原因差异日志写入失败: {exc}")
 
+
+def log_dispute_status_audit(shop_name, shop_domain, dispute_item, rest_type,
+                             rest_status, graphql_type, graphql_status, finalized_on):
+    """Persist REST-vs-GraphQL status/type differences and suspicious Inquiry+LOST pairs."""
+    mismatch = (rest_type != graphql_type) or (rest_status != graphql_status)
+    inquiry_lost = graphql_type == "INQUIRY" and graphql_status == "LOST"
+    if not mismatch and not inquiry_lost:
+        return
+
+    entry = {
+        "time_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+        "shop_name": shop_name,
+        "shop_domain": shop_domain,
+        "dispute_id": str(dispute_item.get("id", "")),
+        "order_id": str(dispute_item.get("order_id", "")),
+        "rest_type": rest_type,
+        "rest_status": rest_status,
+        "graphql_type": graphql_type,
+        "graphql_status": graphql_status,
+        "finalized_on": finalized_on,
+        "selected_type": graphql_type,
+        "selected_status": graphql_status,
+        "inquiry_lost_needs_review": inquiry_lost,
+    }
+    print("⚠️ [案件类型/状态核验] " + json.dumps(entry, ensure_ascii=False))
+    try:
+        with FILE_LOCK:
+            with open("dispute_status_audit.jsonl", "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception as exc:
+        print(f"⚠️ 案件状态核验日志写入失败: {exc}")
+
 TYPE_MAP = {"CHARGEBACK": "拒付", "INQUIRY": "调单/问询"}
+
+# Formal chargeback labels. INQUIRY is translated separately below so an inquiry
+# can never be mislabeled as a successful/failed appeal merely because of enum reuse.
 STATUS_MAP = {
-    "NEEDS_RESPONSE": "待回复", "UNDER_REVIEW": "审查中",
-    "WON": "申诉成功(胜诉)", "LOST": "申诉失败(败诉)",
-    "ACCEPTED": "已接受(放弃申诉)", "CHARGE_REFUNDED": "已全额退款"
+    "NEEDS_RESPONSE": "待回复",
+    "UNDER_REVIEW": "审查中",
+    "WON": "申诉成功(胜诉)",
+    "LOST": "申诉失败(败诉)",
+    "ACCEPTED": "已接受(放弃申诉)",
+    "CHARGE_REFUNDED": "争议款已退款",
 }
+
+INQUIRY_STATUS_MAP = {
+    "NEEDS_RESPONSE": "问询待回复",
+    "UNDER_REVIEW": "问询处理中",
+    "CHARGE_REFUNDED": "问询已退款关闭",
+    "ACCEPTED": "问询已接受并关闭",
+    "WON": "问询已关闭（平台标记胜诉）",
+    # An INQUIRY should not be called a lost chargeback. Keep the raw combination
+    # visible as a review item until the merchant checks Shopify Admin.
+    "LOST": "问询已关闭（状态需核实）",
+}
+
+
+def translate_dispute_status(raw_type, raw_status):
+    raw_type = str(raw_type or "").strip().upper()
+    raw_status = str(raw_status or "").strip().upper()
+
+    if raw_type == "INQUIRY":
+        return INQUIRY_STATUS_MAP.get(raw_status, f"问询状态待核实：{raw_status or '未知'}")
+
+    return STATUS_MAP.get(raw_status, raw_status or "未知状态")
+
 
 def get_session():
     session = requests.Session()
@@ -411,6 +481,12 @@ def sync_order_tags_for_disputes(session, shop_name, shop_domain, access_token, 
         item.pop("_raw_reason", None)
         item.pop("_evidence_due_date", None)
         item.pop("_initiated_at", None)
+        item.pop("_rest_type", None)
+        item.pop("_rest_status", None)
+        item.pop("_graphql_type", None)
+        item.pop("_graphql_status", None)
+        item.pop("_finalized_on", None)
+        item.pop("_successful_refund_transactions", None)
 
 
 def load_token_cache():
@@ -467,6 +543,51 @@ def get_access_token(session, store, cache):
         print(f"[{shop_name}] 请求 Token 异常: {e}")
         
     return None
+
+
+def calculate_successful_refunds(refunds, expected_currency=""):
+    """Sum actual successful refund transactions, not item subtotals.
+
+    Shopify refund transactions include the money actually returned, including
+    possible shipping refunds. Failed/pending transactions are not counted.
+    """
+    total = Decimal("0")
+    latest_refund_at = ""
+    successful_transaction_count = 0
+    expected_currency = str(expected_currency or "").strip().upper()
+
+    for refund in refunds or []:
+        refund_created_at = str(refund.get("created_at") or "")
+        for txn in refund.get("transactions") or []:
+            if str(txn.get("kind") or "").strip().lower() != "refund":
+                continue
+            if str(txn.get("status") or "").strip().lower() != "success":
+                continue
+
+            txn_currency = str(txn.get("currency") or "").strip().upper()
+            if expected_currency and txn_currency and txn_currency != expected_currency:
+                print(
+                    "⚠️ [退款币种不一致] 跳过无法直接相加的退款交易："
+                    f"退款币种={txn_currency}，案件币种={expected_currency}，交易ID={txn.get('id', '')}"
+                )
+                continue
+
+            try:
+                amount = Decimal(str(txn.get("amount") or "0"))
+            except (InvalidOperation, TypeError, ValueError):
+                print(f"⚠️ 退款交易金额无法解析，交易ID={txn.get('id', '')}，金额={txn.get('amount')!r}")
+                continue
+
+            if amount <= 0:
+                continue
+
+            total += amount
+            successful_transaction_count += 1
+            txn_time = str(txn.get("processed_at") or txn.get("created_at") or refund_created_at)
+            if txn_time > latest_refund_at:
+                latest_refund_at = txn_time
+
+    return float(total.quantize(Decimal("0.01"))), successful_transaction_count, latest_refund_at
 
 def get_order_details(session, shop_name, shop_domain, access_token, order_id, evidence_due_date="", raw_reason=""):
     """只读取订单信息，不在并发案件线程里修改订单标签。"""
@@ -600,47 +721,75 @@ def fetch_disputes_for_shop(store, token_cache):
                             break
                 url = next_url
 
-        # 用 GraphQL reasonDetails.reason 交叉核验 REST 列表 reason。
-        # 任一案件无法由 GraphQL 对上时，整个店铺本轮停止写入，避免把错因继续传播。
+        # 用 GraphQL 同时核验案件原因、类型和状态；GraphQL 数据作为规范来源。
+        # 任一 REST 案件无法在 GraphQL 匹配时，本店本轮停止同步，避免错误状态写入。
         if raw_dispute_items:
-            graphql_reasons = fetch_graphql_dispute_reasons(session, shop_domain, access_token)
+            graphql_details = fetch_graphql_dispute_details(session, shop_domain, access_token)
             missing_ids = [str(item.get("id", "")) for item in raw_dispute_items
-                           if str(item.get("id", "")) not in graphql_reasons]
-            missing_reasons = [str(item.get("id", "")) for item in raw_dispute_items
-                               if str(item.get("id", "")) in graphql_reasons
-                               and not graphql_reasons[str(item.get("id", ""))].get("reason")]
-            if missing_ids or missing_reasons:
-                sample = (missing_ids + missing_reasons)[:20]
+                           if str(item.get("id", "")) not in graphql_details]
+            incomplete_ids = [
+                str(item.get("id", "")) for item in raw_dispute_items
+                if str(item.get("id", "")) in graphql_details
+                and (
+                    not graphql_details[str(item.get("id", ""))].get("reason")
+                    or not graphql_details[str(item.get("id", ""))].get("type")
+                    or not graphql_details[str(item.get("id", ""))].get("status")
+                )
+            ]
+            if missing_ids or incomplete_ids:
+                sample = (missing_ids + incomplete_ids)[:20]
                 raise RuntimeError(
-                    "GraphQL 拒付案件与 REST 列表未能完整匹配；为避免错误原因写入，本店本轮不做同步。"
-                    f"缺失/无原因案件ID示例: {sample}。请确认 GraphQL 权限及 API 数据完整性。"
+                    "GraphQL 拒付案件与 REST 列表未能完整匹配，或 GraphQL 缺少原因/类型/状态；"
+                    "为避免错误写入，本店本轮不做同步。"
+                    f"案件ID示例: {sample}。请确认 GraphQL 权限及 API 数据完整性。"
                 )
 
             for dispute_item in raw_dispute_items:
-                dispute_id_for_reason = str(dispute_item.get("id", ""))
+                dispute_id = str(dispute_item.get("id", ""))
+                canonical = graphql_details[dispute_id]
+
                 rest_reason = normalize_reason_code(dispute_item.get("reason"))
-                canonical = graphql_reasons[dispute_id_for_reason]
                 graphql_reason = canonical["reason"]
                 network_code = canonical.get("network_reason_code", "")
-                if (rest_reason and rest_reason != graphql_reason) or dispute_id_for_reason in REASON_AUDIT_TARGET_IDS:
+
+                rest_type = str(dispute_item.get("type") or "").strip().upper()
+                rest_status = str(dispute_item.get("status") or "").strip().upper()
+                graphql_type = canonical["type"]
+                graphql_status = canonical["status"]
+                finalized_on = canonical.get("finalized_on", "")
+
+                if (rest_reason and rest_reason != graphql_reason) or dispute_id in REASON_AUDIT_TARGET_IDS:
                     log_reason_mismatch(
                         shop_name, shop_domain, dispute_item,
                         rest_reason, graphql_reason, network_code
                     )
+
+                log_dispute_status_audit(
+                    shop_name, shop_domain, dispute_item,
+                    rest_type, rest_status, graphql_type, graphql_status, finalized_on
+                )
+
                 dispute_item["_rest_reason"] = rest_reason
+                dispute_item["_rest_type"] = rest_type
+                dispute_item["_rest_status"] = rest_status
+                dispute_item["_graphql_type"] = graphql_type
+                dispute_item["_graphql_status"] = graphql_status
+                dispute_item["_finalized_on"] = finalized_on
                 dispute_item["reason"] = graphql_reason
+                dispute_item["type"] = graphql_type
+                dispute_item["status"] = graphql_status
                 dispute_item["network_reason_code"] = network_code
 
         # 店铺内部订单详情抓取引入并发池优化
         if raw_dispute_items:
             def process_single_dispute(d):
                 dispute_id = str(d["id"])
-                raw_type = str(d.get("type", "CHARGEBACK")).upper()
-                raw_status = str(d.get("status", "")).upper()
+                raw_type = str(d.get("_graphql_type") or d.get("type") or "CHARGEBACK").upper()
+                raw_status = str(d.get("_graphql_status") or d.get("status") or "").upper()
                 raw_reason = normalize_reason_code(d.get("reason", ""))
 
                 type_cn = TYPE_MAP.get(raw_type, raw_type)
-                status_cn = STATUS_MAP.get(raw_status, raw_status)
+                status_cn = translate_dispute_status(raw_type, raw_status)
                 reason_cn = REASON_MAP.get(raw_reason, raw_reason if raw_reason else "未知原因")
                 
                 evidence_due_date = d.get("evidence_due_by", "") or "无"
@@ -653,18 +802,25 @@ def fetch_disputes_for_shop(store, token_cache):
                     evidence_due_date=evidence_due_date, raw_reason=raw_reason
                  )
                 
-                refund_count = len(refunds)
-                is_refunded = "是" if refund_count > 0 else "否"
-                total_refunded = 0.0
-                last_refund_at = ""
-                for ref in refunds:
-                    for line_item in ref.get("refund_line_items", []):
-                        total_refunded += float(line_item.get("subtotal", 0.0))
-                    ref_time = ref.get("created_at", "")
-                    if ref_time > last_refund_at:
-                        last_refund_at = ref_time
-                        
-                is_partially_refunded = "是" if (0 < total_refunded < order_total) else "否"
+                refund_count = len(refunds)  # Shopify Refund 记录数，保持原表格口径
+                total_refunded, successful_refund_txn_count, last_refund_at = calculate_successful_refunds(
+                    refunds, expected_currency=d.get("currency", "")
+                )
+                # 只有实际成功的退款交易金额大于 0，才标记为已退款。
+                is_refunded = "是" if total_refunded > 0 else "否"
+                is_partially_refunded = (
+                    "是" if (0 < total_refunded and total_refunded + 0.01 < order_total) else "否"
+                )
+
+                # Inquiry + LOST 不等于正式拒付败诉；结合订单实际退款金额显示问询关闭状态。
+                if raw_type == "INQUIRY" and raw_status == "LOST":
+                    if order_total > 0 and total_refunded + 0.01 >= order_total:
+                        status_cn = "问询已关闭（订单已全额退款）"
+                    elif total_refunded > 0:
+                        status_cn = "问询已关闭（订单已有退款，状态需核实）"
+                    else:
+                        status_cn = "问询已关闭（状态需核实）"
+
                 needs_response = "是" if raw_status == "NEEDS_RESPONSE" else "否"
                 
                 return {
@@ -696,6 +852,12 @@ def fetch_disputes_for_shop(store, token_cache):
                     "_raw_reason": raw_reason,
                     "_network_reason_code": str(d.get("network_reason_code", "") or ""),
                     "_rest_reason": str(d.get("_rest_reason", "") or ""),
+                    "_rest_type": str(d.get("_rest_type", "") or ""),
+                    "_rest_status": str(d.get("_rest_status", "") or ""),
+                    "_graphql_type": raw_type,
+                    "_graphql_status": raw_status,
+                    "_finalized_on": str(d.get("_finalized_on", "") or ""),
+                    "_successful_refund_transactions": successful_refund_txn_count,
                     "_evidence_due_date": evidence_due_date,
                     "_initiated_at": d.get("initiated_at", "")
                 }
