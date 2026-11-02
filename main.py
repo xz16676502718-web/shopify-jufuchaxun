@@ -14,14 +14,14 @@ TOKEN_CACHE_FILE = "token_cache.json"
 
 # WebApp 部署地址
 GAS_WEBHOOK_URL = "https://script.google.com/macros/s/AKfycbz5lkaskmNJRA_X0iL_QQyRabeLzmnWmtuTETu3TrUEew7UOXzSd-ccas2yK0h68GE/exec"
-API_VERSION = "2026-01"
+API_VERSION = "2026-10"
 
 # 核心性能配置
 MAX_STORE_WORKERS = 10  # 店铺级并发数（从 3 提升至 10）
 MAX_ORDER_WORKERS = 4   # 单店内部订单详情并发数
 
 FILE_LOCK = threading.Lock()
-# 本次截图对应的案件：即使 REST 与 GraphQL 返回相同，也记录两边原始原因便于核验。
+# 特定案件：即使 REST 与 GraphQL 返回相同，也记录两边原始原因便于核验。
 REASON_AUDIT_TARGET_IDS = {"15997534549"}
 
 DISPUTE_TAG_PATTERN = re.compile(r'^(\d{1,2}\.\d{1,2})(?:截止)?-(.+)$')
@@ -90,6 +90,7 @@ def fetch_graphql_dispute_details(session, shop_domain, access_token):
         edges {
           cursor
           node {
+            id
             legacyResourceId
             type
             status
@@ -97,6 +98,14 @@ def fetch_graphql_dispute_details(session, shop_domain, access_token):
             reasonDetails {
               reason
               networkReasonCode
+            }
+            order {
+              id
+              disputes {
+                id
+                initiatedAs
+                status
+              }
             }
           }
         }
@@ -141,17 +150,40 @@ def fetch_graphql_dispute_details(session, shop_domain, access_token):
         for edge in connection.get("edges") or []:
             node = edge.get("node") or {}
             legacy_id = str(node.get("legacyResourceId") or "").strip()
+            dispute_gid = str(node.get("id") or "").strip()
             reason_details = node.get("reasonDetails") or {}
             reason = normalize_reason_code(reason_details.get("reason"))
             dispute_type = str(node.get("type") or "").strip().upper()
             dispute_status = str(node.get("status") or "").strip().upper()
+            finalized_on = str(node.get("finalizedOn") or "").strip()
+
+            # Order.disputes is the summary displayed on the order itself in Shopify Admin.
+            # Match by GID first; if the order has exactly one dispute, use that sole summary.
+            order_node = node.get("order") or {}
+            order_summaries = order_node.get("disputes") or []
+            matched_summary = next(
+                (summary for summary in order_summaries
+                 if str(summary.get("id") or "").strip() == dispute_gid),
+                None,
+            )
+            if matched_summary is None and len(order_summaries) == 1:
+                matched_summary = order_summaries[0]
+
+            order_summary_type = str((matched_summary or {}).get("initiatedAs") or "").strip().upper()
+            order_summary_status = str((matched_summary or {}).get("status") or "").strip().upper()
+            order_summary_id = str((matched_summary or {}).get("id") or "").strip()
+
             if legacy_id:
                 result[legacy_id] = {
                     "reason": reason,
                     "network_reason_code": str(reason_details.get("networkReasonCode") or "").strip(),
                     "type": dispute_type,
                     "status": dispute_status,
-                    "finalized_on": str(node.get("finalizedOn") or "").strip(),
+                    "finalized_on": finalized_on,
+                    "dispute_gid": dispute_gid,
+                    "order_summary_id": order_summary_id,
+                    "order_summary_type": order_summary_type,
+                    "order_summary_status": order_summary_status,
                 }
 
         page_info = connection.get("pageInfo") or {}
@@ -190,11 +222,21 @@ def log_reason_mismatch(shop_name, shop_domain, dispute_item, rest_reason, graph
 
 
 def log_dispute_status_audit(shop_name, shop_domain, dispute_item, rest_type,
-                             rest_status, graphql_type, graphql_status, finalized_on):
-    """Persist REST-vs-GraphQL status/type differences and suspicious Inquiry+LOST pairs."""
-    mismatch = (rest_type != graphql_type) or (rest_status != graphql_status)
-    inquiry_lost = graphql_type == "INQUIRY" and graphql_status == "LOST"
-    if not mismatch and not inquiry_lost:
+                             rest_status, graphql_type, graphql_status, finalized_on,
+                             order_summary_type="", order_summary_status="", selected_type="",
+                             selected_status=""):
+    """Persist status-source differences and statuses that need special handling."""
+    selected_type = selected_type or graphql_type
+    selected_status = selected_status or graphql_status
+    rest_graphql_mismatch = (rest_type != graphql_type) or (rest_status != graphql_status)
+    order_summary_mismatch = (
+        bool(order_summary_type and order_summary_type != graphql_type)
+        or bool(order_summary_status and order_summary_status != graphql_status)
+    )
+    inquiry_lost = selected_type == "INQUIRY" and selected_status == "LOST"
+    prevented = selected_status == "PREVENTED"
+    chargeback_lost = selected_type == "CHARGEBACK" and selected_status == "LOST"
+    if not (rest_graphql_mismatch or order_summary_mismatch or inquiry_lost or prevented or chargeback_lost):
         return
 
     entry = {
@@ -207,10 +249,14 @@ def log_dispute_status_audit(shop_name, shop_domain, dispute_item, rest_type,
         "rest_status": rest_status,
         "graphql_type": graphql_type,
         "graphql_status": graphql_status,
+        "order_summary_type": order_summary_type,
+        "order_summary_status": order_summary_status,
         "finalized_on": finalized_on,
-        "selected_type": graphql_type,
-        "selected_status": graphql_status,
+        "selected_type": selected_type,
+        "selected_status": selected_status,
         "inquiry_lost_needs_review": inquiry_lost,
+        "chargeback_lost_needs_review": chargeback_lost,
+        "prevented_status": prevented,
     }
     print("⚠️ [案件类型/状态核验] " + json.dumps(entry, ensure_ascii=False))
     try:
@@ -231,14 +277,17 @@ STATUS_MAP = {
     "LOST": "申诉失败(败诉)",
     "ACCEPTED": "已接受(放弃申诉)",
     "CHARGE_REFUNDED": "争议款已退款",
+    # Network-level prevention: the dispute was stopped before becoming a formal chargeback.
+    "PREVENTED": "拒付已解决（自动阻止升级）",
 }
 
 INQUIRY_STATUS_MAP = {
-    "NEEDS_RESPONSE": "查询未解决",
-    "UNDER_REVIEW": "查询审核中",
-    "CHARGE_REFUNDED": "查询已关闭",
+    "NEEDS_RESPONSE": "查询待回复",
+    "UNDER_REVIEW": "查询处理中",
+    "CHARGE_REFUNDED": "查询已退款关闭",
     "ACCEPTED": "查询已接受并关闭",
     "WON": "查询已关闭（平台标记胜诉）",
+    "PREVENTED": "查询已解决（阻止升级为拒付）",
     # An INQUIRY should not be called a lost chargeback. Keep the raw combination
     # visible as a review item until the merchant checks Shopify Admin.
     "LOST": "查询已关闭（状态需核实）",
@@ -485,6 +534,8 @@ def sync_order_tags_for_disputes(session, shop_name, shop_domain, access_token, 
         item.pop("_rest_status", None)
         item.pop("_graphql_type", None)
         item.pop("_graphql_status", None)
+        item.pop("_order_summary_type", None)
+        item.pop("_order_summary_status", None)
         item.pop("_finalized_on", None)
         item.pop("_successful_refund_transactions", None)
 
@@ -757,6 +808,19 @@ def fetch_disputes_for_shop(store, token_cache):
                 graphql_type = canonical["type"]
                 graphql_status = canonical["status"]
                 finalized_on = canonical.get("finalized_on", "")
+                order_summary_type = canonical.get("order_summary_type", "")
+                order_summary_status = canonical.get("order_summary_status", "")
+
+                # The order-level summary is queried from the same Shopify order shown in Admin.
+                # Prefer it only when it was safely matched to this dispute (or it is the sole dispute).
+                selected_type = order_summary_type or graphql_type
+                selected_status = order_summary_status or graphql_status
+                if order_summary_status and order_summary_status != graphql_status:
+                    print(
+                        f"⚠️ [订单摘要与Dispute状态不一致] 店铺={shop_name} 案件ID={dispute_id} "
+                        f"Dispute={graphql_type}/{graphql_status} "
+                        f"OrderSummary={order_summary_type}/{order_summary_status}；采用订单摘要状态"
+                    )
 
                 if (rest_reason and rest_reason != graphql_reason) or dispute_id in REASON_AUDIT_TARGET_IDS:
                     log_reason_mismatch(
@@ -766,7 +830,8 @@ def fetch_disputes_for_shop(store, token_cache):
 
                 log_dispute_status_audit(
                     shop_name, shop_domain, dispute_item,
-                    rest_type, rest_status, graphql_type, graphql_status, finalized_on
+                    rest_type, rest_status, graphql_type, graphql_status, finalized_on,
+                    order_summary_type, order_summary_status, selected_type, selected_status
                 )
 
                 dispute_item["_rest_reason"] = rest_reason
@@ -774,18 +839,20 @@ def fetch_disputes_for_shop(store, token_cache):
                 dispute_item["_rest_status"] = rest_status
                 dispute_item["_graphql_type"] = graphql_type
                 dispute_item["_graphql_status"] = graphql_status
+                dispute_item["_order_summary_type"] = order_summary_type
+                dispute_item["_order_summary_status"] = order_summary_status
                 dispute_item["_finalized_on"] = finalized_on
                 dispute_item["reason"] = graphql_reason
-                dispute_item["type"] = graphql_type
-                dispute_item["status"] = graphql_status
+                dispute_item["type"] = selected_type
+                dispute_item["status"] = selected_status
                 dispute_item["network_reason_code"] = network_code
 
         # 店铺内部订单详情抓取引入并发池优化
         if raw_dispute_items:
             def process_single_dispute(d):
                 dispute_id = str(d["id"])
-                raw_type = str(d.get("_graphql_type") or d.get("type") or "CHARGEBACK").upper()
-                raw_status = str(d.get("_graphql_status") or d.get("status") or "").upper()
+                raw_type = str(d.get("type") or d.get("_graphql_type") or "CHARGEBACK").upper()
+                raw_status = str(d.get("status") or d.get("_graphql_status") or "").upper()
                 raw_reason = normalize_reason_code(d.get("reason", ""))
 
                 type_cn = TYPE_MAP.get(raw_type, raw_type)
@@ -854,8 +921,10 @@ def fetch_disputes_for_shop(store, token_cache):
                     "_rest_reason": str(d.get("_rest_reason", "") or ""),
                     "_rest_type": str(d.get("_rest_type", "") or ""),
                     "_rest_status": str(d.get("_rest_status", "") or ""),
-                    "_graphql_type": raw_type,
-                    "_graphql_status": raw_status,
+                    "_graphql_type": str(d.get("_graphql_type", "") or ""),
+                    "_graphql_status": str(d.get("_graphql_status", "") or ""),
+                    "_order_summary_type": str(d.get("_order_summary_type", "") or ""),
+                    "_order_summary_status": str(d.get("_order_summary_status", "") or ""),
                     "_finalized_on": str(d.get("_finalized_on", "") or ""),
                     "_successful_refund_transactions": successful_refund_txn_count,
                     "_evidence_due_date": evidence_due_date,
