@@ -234,14 +234,14 @@ STATUS_MAP = {
 }
 
 INQUIRY_STATUS_MAP = {
-    "NEEDS_RESPONSE": "问询待回复",
-    "UNDER_REVIEW": "问询处理中",
-    "CHARGE_REFUNDED": "问询已退款关闭",
-    "ACCEPTED": "问询已接受并关闭",
-    "WON": "问询已关闭（平台标记胜诉）",
+    "NEEDS_RESPONSE": "查询未解决",
+    "UNDER_REVIEW": "查询审核中",
+    "CHARGE_REFUNDED": "查询已关闭",
+    "ACCEPTED": "查询已接受并关闭",
+    "WON": "查询已关闭（平台标记胜诉）",
     # An INQUIRY should not be called a lost chargeback. Keep the raw combination
     # visible as a review item until the merchant checks Shopify Admin.
-    "LOST": "问询已关闭（状态需核实）",
+    "LOST": "查询已关闭（状态需核实）",
 }
 
 
@@ -250,7 +250,7 @@ def translate_dispute_status(raw_type, raw_status):
     raw_status = str(raw_status or "").strip().upper()
 
     if raw_type == "INQUIRY":
-        return INQUIRY_STATUS_MAP.get(raw_status, f"问询状态待核实：{raw_status or '未知'}")
+        return INQUIRY_STATUS_MAP.get(raw_status, f"查询状态待核实：{raw_status or '未知'}")
 
     return STATUS_MAP.get(raw_status, raw_status or "未知状态")
 
@@ -815,11 +815,11 @@ def fetch_disputes_for_shop(store, token_cache):
                 # Inquiry + LOST 不等于正式拒付败诉；结合订单实际退款金额显示问询关闭状态。
                 if raw_type == "INQUIRY" and raw_status == "LOST":
                     if order_total > 0 and total_refunded + 0.01 >= order_total:
-                        status_cn = "问询已关闭（订单已全额退款）"
+                        status_cn = "查询已关闭（订单已全额退款）"
                     elif total_refunded > 0:
-                        status_cn = "问询已关闭（订单已有退款，状态需核实）"
+                        status_cn = "查询已关闭（订单已有退款，状态需核实）"
                     else:
-                        status_cn = "问询已关闭（状态需核实）"
+                        status_cn = "查询已关闭（状态需核实）"
 
                 needs_response = "是" if raw_status == "NEEDS_RESPONSE" else "否"
                 
