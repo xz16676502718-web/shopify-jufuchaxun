@@ -2,32 +2,52 @@ name: Shopify Dispute Sync
 
 on:
   schedule:
-    # 每天 UTC 时间 0点和12点自动运行（对应北京时间 8点 和 20点）
+    # 每天 UTC 0点和12点运行（北京时间 8点和20点）
     - cron: '0 0,12 * * *'
-  workflow_dispatch: # 开启手动触发按钮
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   run-sync:
     runs-on: ubuntu-24.04
+
     steps:
+      # 1. 拉取仓库代码
       - name: 拉取仓库代码
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
+      # 2. 配置 Python 环境
       - name: 配置 Python 环境
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
-          python-version: '3.9'
+          python-version: '3.12'
 
+      # 3. 安装依赖
       - name: 安装网络依赖库
         run: |
-          pip install requests
+          python -m pip install --upgrade pip
+          python -m pip install requests
 
+      # 4. 从 GitHub Secrets 生成 stores.json
       - name: 从 Secrets 生成 stores.json 配置文件
         env:
           STORES_JSON_CONTENT: ${{ secrets.STORES_JSON }}
         run: |
-          echo "$STORES_JSON_CONTENT" > stores.json
+          if [ -z "$STORES_JSON_CONTENT" ]; then
+            echo "::error::STORES_JSON Secret 未配置或为空"
+            exit 1
+          fi
 
+          printf '%s' "$STORES_JSON_CONTENT" > stores.json
+
+          # 检查 JSON 格式
+          python -m json.tool stores.json > /dev/null
+
+          echo "stores.json 格式验证通过"
+
+      # 5. 执行拒付数据同步
       - name: 执行拒付数据同步
         run: |
           python -u main.py
