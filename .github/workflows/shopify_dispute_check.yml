@@ -12,25 +12,20 @@ permissions:
 jobs:
   run-sync:
     runs-on: ubuntu-24.04
-
     steps:
-      # 1. 拉取仓库代码
       - name: 拉取仓库代码
         uses: actions/checkout@v7
 
-      # 2. 配置 Python 环境
       - name: 配置 Python 环境
         uses: actions/setup-python@v7
         with:
           python-version: '3.12'
 
-      # 3. 安装依赖
       - name: 安装网络依赖库
         run: |
           python -m pip install --upgrade pip
           python -m pip install requests
 
-      # 4. 从 GitHub Secrets 生成 stores.json
       - name: 从 Secrets 生成 stores.json 配置文件
         env:
           STORES_JSON_CONTENT: ${{ secrets.STORES_JSON }}
@@ -39,15 +34,23 @@ jobs:
             echo "::error::STORES_JSON Secret 未配置或为空"
             exit 1
           fi
-
           printf '%s' "$STORES_JSON_CONTENT" > stores.json
-
-          # 检查 JSON 格式
           python -m json.tool stores.json > /dev/null
-
           echo "stores.json 格式验证通过"
 
-      # 5. 执行拒付数据同步
       - name: 执行拒付数据同步
-        run: |
-          python -u main.py
+        run: python -u main.py
+
+      # 即使主程序失败，也上传诊断文件，便于检查具体店铺、订单和 HTTP 状态。
+      - name: 上传同步诊断文件
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shopify-dispute-diagnostics
+          path: |
+            dispute_reason_audit.jsonl
+            dispute_status_audit.jsonl
+            shopify_order_read_errors.jsonl
+            shopify_tag_write_errors.jsonl
+          if-no-files-found: ignore
+          retention-days: 7
