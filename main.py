@@ -282,8 +282,8 @@ STATUS_MAP = {
 }
 
 INQUIRY_STATUS_MAP = {
-    "NEEDS_RESPONSE": "查询未解决/拒付处理中",
-    "UNDER_REVIEW": "查询已提交/拒付已提交/拒付处理中",
+    "NEEDS_RESPONSE": "查询待回复",
+    "UNDER_REVIEW": "查询处理中",
     "CHARGE_REFUNDED": "查询已退款关闭",
     "ACCEPTED": "查询已接受并关闭",
     "WON": "查询已关闭（平台标记胜诉）",
@@ -311,7 +311,7 @@ def get_session():
     session.mount("https://", adapter)
     return session
 
-def safe_request(session, method, url, max_retries=5, **kwargs):
+def safe_request(session, method, url, max_retries=5, retry_delay=2, **kwargs):
     kwargs.setdefault("timeout", (10, 30))
     
     headers = kwargs.get("headers", {})
@@ -335,14 +335,15 @@ def safe_request(session, method, url, max_retries=5, **kwargs):
                 time.sleep(wait_time + attempt * 0.5)
                 continue
             elif resp.status_code in [500, 502, 503, 504]:
-                time.sleep(2 * attempt)
+                if attempt < max_retries:
+                    time.sleep(max(0, retry_delay) * attempt)
                 continue
                 
             return resp
         except (requests.exceptions.RequestException, Exception) as e:
             if attempt == max_retries:
                 raise e
-            time.sleep(2 * attempt)
+            time.sleep(max(0, retry_delay) * attempt)
             
     return last_resp
 
@@ -466,78 +467,140 @@ def process_order_tags_for_disputes(tags_list, dispute_items):
     return other_tags + result_dispute_tags
 
 
+def _split_order_tags(raw_tags):
+    """Normalize Shopify comma-separated tags or the sheet's newline format."""
+    if not raw_tags:
+        return []
+    return [part.strip() for part in re.split(r"[,\n]+", str(raw_tags)) if part.strip()]
+
+
 def sync_order_tags_for_disputes(session, shop_name, shop_domain, access_token, disputes):
-    """按店铺+订单聚合案件，只对每个订单写回一次标签。"""
+    """Update each order's dispute tags with short retries and a cached-tag fallback.
+
+    The order details endpoint was already read while parsing each dispute. If the
+    second, tags-only GET has a transient timeout, use that fresh-enough tag snapshot
+    to build and PUT the merged tags instead of abandoning the update. Orders are
+    processed concurrently to keep total runtime low.
+    """
     grouped = {}
     for item in disputes:
         order_id = item.get("_order_id")
         if order_id:
             grouped.setdefault(str(order_id), []).append(item)
 
-    for order_id, items in grouped.items():
+    if not grouped:
+        _strip_internal_dispute_fields(disputes)
+        return
+
+    def process_one_order(order_id, items):
         url = f"https://{shop_domain}/admin/api/{API_VERSION}/orders/{order_id}.json?fields=id,name,tags"
         headers = {"X-Shopify-Access-Token": access_token}
+
+        # Cached tags come from get_order_details(), which is already part of the
+        # order-enrichment step. They allow the table and Shopify update to continue
+        # when this additional fresh GET is unavailable.
+        cached_tags = _split_order_tags(items[0].get("order_tags", ""))
+        cache_loaded = bool(items[0].get("_order_tags_loaded", False))
+        order_name = items[0].get("order_name", "N/A")
+        tags_source = "Shopify实时标签"
+
         try:
-            response = safe_request(session, "GET", url, headers=headers)
-            if not response or response.status_code != 200:
-                status_code = response.status_code if response else "无响应"
-                print(f"⚠️ [{shop_name}] 订单 {order_id} 读取标签失败，HTTP {status_code}；跳过标签写回")
-                continue
-
-            order_data = response.json().get("order", {})
-            order_name = order_data.get("name", items[0].get("order_name", "N/A"))
-            raw_tags = order_data.get("tags", "") or ""
-            tags_list = [tag.strip() for tag in raw_tags.split(",") if tag.strip()]
-            new_tags_list = process_order_tags_for_disputes(tags_list, items)
-
-            if set(new_tags_list) != set(tags_list):
-                update_url = f"https://{shop_domain}/admin/api/{API_VERSION}/orders/{order_id}.json"
-                update_headers = {
-                    "X-Shopify-Access-Token": access_token,
-                    "Content-Type": "application/json",
-                }
-                payload = {"order": {"id": order_id, "tags": ", ".join(new_tags_list)}}
-                update_response = safe_request(
-                    session, "PUT", update_url, headers=update_headers, json=payload
-                )
-                if not update_response or update_response.status_code != 200:
-                    status_code = update_response.status_code if update_response else "无响应"
-                    print(f"⚠️ [{shop_name}] 订单 {order_name} 标签写回失败，HTTP {status_code}")
-                    new_tags_list = tags_list
-                else:
-                    print(
-                        f"***{shop_name}*** 订单 {order_name} 标签已按案件汇总更新为: "
-                        f"{', '.join(new_tags_list)}"
-                    )
-            else:
-                # Shopify 上的标签集合已正确，无需为顺序差异重复写回。
-                new_tags_list = tags_list
-
-            formatted_tags = "\n".join(new_tags_list)
-            for item in items:
-                item["order_tags"] = formatted_tags
-                print(
-                    f"[拒付原因核对] 店铺={shop_name} 案件ID={item.get('dispute_id')} "
-                    f"订单={order_name} 原因码={item.get('_raw_reason')!r} "
-                    f"表格原因={item.get('reason')!r}"
-                )
+            response = safe_request(
+                session, "GET", url, headers=headers,
+                max_retries=2, retry_delay=0.25, timeout=(3, 6)
+            )
         except Exception as exc:
-            print(f"⚠️ [{shop_name}] 订单 {order_id} 标签汇总更新异常: {exc}")
+            response = None
+            get_error = type(exc).__name__
+        else:
+            get_error = "无响应"
 
-    # 仅保留对 GAS 有用的业务字段，内部排错字段不推送。
+        if response is not None and response.status_code == 200:
+            order_data = response.json().get("order", {})
+            order_name = order_data.get("name", order_name)
+            tags_list = _split_order_tags(order_data.get("tags", ""))
+        else:
+            if not cache_loaded:
+                print(
+                    f"⚠️ [{shop_name}] 订单 {order_id} 实时标签读取失败（{get_error}），"
+                    "且订单详情阶段没有可用标签快照；保留表格案件数据，本次不冒险覆盖 Shopify 标签。"
+                )
+                return
+            tags_list = cached_tags
+            tags_source = "订单详情缓存标签"
+            status_code = response.status_code if response is not None else "无响应"
+            print(
+                f"⚠️ [{shop_name}] 订单 {order_id} 实时标签读取失败（HTTP {status_code}/{get_error}）；"
+                f"改用刚才读取的标签快照继续更新，避免跳过表格标签。"
+            )
+
+        new_tags_list = process_order_tags_for_disputes(tags_list, items)
+        formatted_tags = "\n".join(new_tags_list)
+
+        # Always put the intended/current merged value on the outgoing sheet row.
+        # If Shopify PUT later fails, the log makes that explicit; the spreadsheet
+        # still receives the dispute record and the best available tag snapshot.
+        if set(new_tags_list) != set(tags_list):
+            update_url = f"https://{shop_domain}/admin/api/{API_VERSION}/orders/{order_id}.json"
+            update_headers = {
+                "X-Shopify-Access-Token": access_token,
+                "Content-Type": "application/json",
+            }
+            payload = {"order": {"id": order_id, "tags": ", ".join(new_tags_list)}}
+            try:
+                update_response = safe_request(
+                    session, "PUT", update_url, headers=update_headers, json=payload,
+                    max_retries=2, retry_delay=0.25, timeout=(3, 6)
+                )
+            except Exception as exc:
+                update_response = None
+                update_error = type(exc).__name__
+            else:
+                update_error = "无响应"
+
+            if not update_response or update_response.status_code != 200:
+                status_code = update_response.status_code if update_response else "无响应"
+                print(
+                    f"⚠️ [{shop_name}] 订单 {order_name} 标签写回 Shopify 失败，HTTP {status_code}/{update_error}；"
+                    "案件和合并后的标签仍会推送到表格，下一轮同步会再次尝试 Shopify 标签写回。"
+                )
+            else:
+                print(
+                    f"***{shop_name}*** 订单 {order_name} 标签已更新（来源：{tags_source}）："
+                    f"{', '.join(new_tags_list)}"
+                )
+        else:
+            print(f"[{shop_name}] 订单 {order_name} 标签无需变更。")
+
+        for item in items:
+            item["order_tags"] = formatted_tags
+
+    max_workers = min(MAX_ORDER_WORKERS, len(grouped))
+    with ThreadPoolExecutor(max_workers=max_workers) as tag_executor:
+        futures = [
+            tag_executor.submit(process_one_order, order_id, items)
+            for order_id, items in grouped.items()
+        ]
+        for future in as_completed(futures):
+            try:
+                future.result()
+            except Exception as exc:
+                print(f"⚠️ [{shop_name}] 订单标签并发处理异常: {type(exc).__name__}: {exc}")
+
+    _strip_internal_dispute_fields(disputes)
+
+
+def _strip_internal_dispute_fields(disputes):
+    """Remove internal-only values before sending dispute rows to GAS."""
+    internal_keys = (
+        "_order_id", "_raw_reason", "_evidence_due_date", "_initiated_at",
+        "_rest_type", "_rest_status", "_graphql_type", "_graphql_status",
+        "_order_summary_type", "_order_summary_status", "_finalized_on",
+        "_successful_refund_transactions", "_order_tags_loaded",
+    )
     for item in disputes:
-        item.pop("_order_id", None)
-        item.pop("_raw_reason", None)
-        item.pop("_evidence_due_date", None)
-        item.pop("_initiated_at", None)
-        item.pop("_rest_type", None)
-        item.pop("_rest_status", None)
-        item.pop("_graphql_type", None)
-        item.pop("_graphql_status", None)
-        item.pop("_order_summary_type", None)
-        item.pop("_order_summary_status", None)
-        item.pop("_finalized_on", None)
-        item.pop("_successful_refund_transactions", None)
+        for key in internal_keys:
+            item.pop(key, None)
 
 
 def load_token_cache():
@@ -643,12 +706,15 @@ def calculate_successful_refunds(refunds, expected_currency=""):
 def get_order_details(session, shop_name, shop_domain, access_token, order_id, evidence_due_date="", raw_reason=""):
     """只读取订单信息，不在并发案件线程里修改订单标签。"""
     if not order_id:
-        return "N/A", 0.0, "N/A", "N/A", [], "", "无", "无"
+        return "N/A", 0.0, "N/A", "N/A", [], "", "无", "无", False
 
     url = f"https://{shop_domain}/admin/api/{API_VERSION}/orders/{order_id}.json?fields=id,name,total_price,total_price_set,customer,refunds,tags,fulfillments"
     headers = {"X-Shopify-Access-Token": access_token}
     try:
-        res = safe_request(session, "GET", url, headers=headers)
+        res = safe_request(
+            session, "GET", url, headers=headers,
+            max_retries=2, retry_delay=0.25, timeout=(5, 10)
+        )
         if res and res.status_code == 200:
             ord_data = res.json().get("order", {})
             order_name = ord_data.get("name", "N/A")
@@ -688,14 +754,16 @@ def get_order_details(session, shop_name, shop_domain, access_token, order_id, e
             carrier_str = "\n".join(carriers) if carriers else "无"
             tracking_str = "\n".join(tracking_numbers) if tracking_numbers else "无"
             return (order_name, order_total, cust_name, cust_email, refunds,
-                    formatted_tags, carrier_str, tracking_str)
+                    formatted_tags, carrier_str, tracking_str, True)
 
         if res:
             print(f"⚠️ [{shop_name}] 获取订单 {order_id} 详情失败，HTTP {res.status_code}: {res.text[:200]}")
+        else:
+            print(f"⚠️ [{shop_name}] 获取订单 {order_id} 详情无响应；保留案件基础信息继续同步。")
     except Exception as exc:
         print(f"[{shop_name}] 获取订单 {order_id} 详情异常: {exc}")
 
-    return "N/A", 0.0, "N/A", "N/A", [], "", "无", "无"
+    return "N/A", 0.0, "N/A", "N/A", [], "", "无", "无", False
 
 def fetch_disputes_for_shop(store, token_cache):
     shop_name = store.get("name", store["domain"])
@@ -863,8 +931,8 @@ def fetch_disputes_for_shop(store, token_cache):
                 unique_key = f"{shop_domain}|{dispute_id}"
                 order_id = d.get("order_id")
                 
-                (order_name, order_total, cust_name, cust_email, 
-                 refunds, order_tags, carrier, tracking_number) = get_order_details(
+                (order_name, order_total, cust_name, cust_email,
+                 refunds, order_tags, carrier, tracking_number, order_tags_loaded) = get_order_details(
                     session, shop_name, shop_domain, access_token, order_id, 
                     evidence_due_date=evidence_due_date, raw_reason=raw_reason
                  )
@@ -916,6 +984,7 @@ def fetch_disputes_for_shop(store, token_cache):
                     "carrier": carrier,
                     "tracking_number": tracking_number,
                     "_order_id": order_id,
+                    "_order_tags_loaded": order_tags_loaded,
                     "_raw_reason": raw_reason,
                     "_network_reason_code": str(d.get("network_reason_code", "") or ""),
                     "_rest_reason": str(d.get("_rest_reason", "") or ""),
@@ -975,11 +1044,12 @@ def fetch_disputes_for_shop(store, token_cache):
 
 def post_to_gas(session, action, item_key, item_list, batch_size=500, max_retries=6):  # 🚀 批次大小提升至 500
     if not item_list:
-        return
-        
+        return True
+
+    all_batches_success = True
     headers = {"Content-Type": "application/json"}
     total = len(item_list)
-    
+
     for i in range(0, total, batch_size):
         chunk = item_list[i:i + batch_size]
         payload = {"action": action, item_key: chunk}
@@ -987,7 +1057,16 @@ def post_to_gas(session, action, item_key, item_list, batch_size=500, max_retrie
         
         for attempt in range(1, max_retries + 1):
             # 🚀 单批次变大，适当放宽超时时间到 90 秒
-            res = safe_request(session, "POST", GAS_WEBHOOK_URL, json=payload, headers=headers, timeout=(10, 90))
+            # 外层循环负责重试；单次请求不再叠加 safe_request 的内部重试，避免重试次数相乘。
+            try:
+                res = safe_request(
+                    session, "POST", GAS_WEBHOOK_URL, json=payload, headers=headers,
+                    max_retries=1, timeout=(10, 90)
+                )
+            except Exception as exc:
+                res = None
+                print(f"[{action}] GAS 请求异常（第 {attempt}/{max_retries} 次）：{type(exc).__name__}: {exc}")
+
             if res and res.status_code == 200:
                 try:
                     res_json = res.json()
@@ -997,28 +1076,35 @@ def post_to_gas(session, action, item_key, item_list, batch_size=500, max_retrie
                         break
                     elif res_json.get("status") == "error" and "Lock timeout" in res_json.get("message", ""):
                         wait = 3 * (2 ** (attempt - 1))
-                        print(f"[{action}] GAS 服务繁忙 (Lock timeout)，等待 {wait} 秒后重试 (第 {attempt}/{max_retries} 次)...")
-                        time.sleep(wait)
+                        if attempt < max_retries:
+                            print(f"[{action}] GAS 服务繁忙 (Lock timeout)，等待 {wait} 秒后重试 (第 {attempt}/{max_retries} 次)...")
+                            time.sleep(wait)
                         continue
                     else:
                         wait = 3 * attempt
-                        print(f"[{action}] GAS 返回了不符合预期的响应: {res.text[:100]}，等待 {wait} 秒后重试 (第 {attempt}/{max_retries} 次)...")
-                        time.sleep(wait)
+                        if attempt < max_retries:
+                            print(f"[{action}] GAS 返回了不符合预期的响应: {res.text[:100]}，等待 {wait} 秒后重试 (第 {attempt}/{max_retries} 次)...")
+                            time.sleep(wait)
                         continue
                 except Exception:
                     wait = 3 * attempt
-                    print(f"[{action}] GAS 返回了非 JSON 响应，等待 {wait} 秒后重试 (第 {attempt}/{max_retries} 次)...")
-                    time.sleep(wait)
+                    if attempt < max_retries:
+                        print(f"[{action}] GAS 返回了非 JSON 响应，等待 {wait} 秒后重试 (第 {attempt}/{max_retries} 次)...")
+                        time.sleep(wait)
                     continue
             else:
                 wait = 3 * attempt
-                print(f"[{action}] 推送异常 (Status: {res.status_code if res else 'None'})，等待 {wait} 秒后重试 (第 {attempt}/{max_retries} 次)...")
-                time.sleep(wait)
+                if attempt < max_retries:
+                    print(f"[{action}] 推送异常 (Status: {res.status_code if res else 'None'})，等待 {wait} 秒后重试 (第 {attempt}/{max_retries} 次)...")
+                    time.sleep(wait)
                 
         if not success:
+            all_batches_success = False
             print(f"❌ [{action}] 批次 ({i+1}-{min(i+batch_size, total)}/{total}) 经过 {max_retries} 次重试后仍然失败，请检查 GAS 后端限制！")
-            
+
         time.sleep(0.1)  # 🚀 将批次间歇缩短至 0.1 秒，大幅提速
+
+    return all_batches_success
 
 def main():
     if not os.path.exists(STORES_JSON_PATH):
@@ -1049,7 +1135,12 @@ def main():
     session = get_session()
     
     if all_disputes:
-        post_to_gas(session, "SYNC_DISPUTES", "disputes", all_disputes, batch_size=500)
+        print(f"[SYNC_DISPUTES] 准备向表格推送 {len(all_disputes)} 条案件记录。")
+        sync_success = post_to_gas(session, "SYNC_DISPUTES", "disputes", all_disputes, batch_size=500)
+        if not sync_success:
+            raise RuntimeError("拒付案件数据未能完整推送到 Google Sheets；本次工作流应标记为失败并检查 GAS 日志。")
+    else:
+        print("[SYNC_DISPUTES] 本轮没有抓取到可推送的案件记录。")
         
     if all_sync_statuses:
         post_to_gas(session, "UPDATE_SYNC_STATUS", "sync_status", all_sync_statuses, batch_size=500)
