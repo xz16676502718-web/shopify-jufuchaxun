@@ -7,6 +7,7 @@ import requests
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from decimal import Decimal, InvalidOperation
+from urllib.parse import urlparse
 
 # ==================== 配置区 ====================
 STORES_JSON_PATH = "stores.json"
@@ -21,8 +22,70 @@ MAX_STORE_WORKERS = 10  # 店铺级并发数（从 3 提升至 10）
 MAX_ORDER_WORKERS = 4   # 单店内部订单详情并发数
 
 FILE_LOCK = threading.Lock()
+COUNTER_LOCK = threading.Lock()
+AUDIT_COUNTERS = {
+    "reason_source_mismatch": 0,
+    "status_source_mismatch": 0,
+    "inquiry_lost_review": 0,
+    "order_detail_read_failure": 0,
+    "tag_write_failure": 0,
+    "tag_write_skipped_no_snapshot": 0,
+}
+
+# Shopify REST Admin API default standard rate is 2 requests/second per app/store.
+# Keep each store below that rate; stores are throttled independently, so other stores continue.
+SHOPIFY_REST_MIN_INTERVAL = 0.55
+SHOPIFY_RATE_LIMITERS = {}
+SHOPIFY_RATE_LIMITERS_LOCK = threading.Lock()
+
 # 特定案件：即使 REST 与 GraphQL 返回相同，也记录两边原始原因便于核验。
 REASON_AUDIT_TARGET_IDS = {"15997534549"}
+
+
+def increment_audit_counter(name, amount=1):
+    with COUNTER_LOCK:
+        AUDIT_COUNTERS[name] = AUDIT_COUNTERS.get(name, 0) + amount
+
+
+def _get_shopify_rest_limiter(url):
+    parsed = urlparse(url)
+    if "/admin/api/" not in parsed.path or parsed.path.endswith("/graphql.json"):
+        return None
+    host = (parsed.hostname or "").lower()
+    if not host.endswith("myshopify.com"):
+        return None
+    with SHOPIFY_RATE_LIMITERS_LOCK:
+        limiter = SHOPIFY_RATE_LIMITERS.get(host)
+        if limiter is None:
+            limiter = {
+                "lock": threading.Lock(),
+                "next_allowed": 0.0,
+                "blocked_until": 0.0,
+            }
+            SHOPIFY_RATE_LIMITERS[host] = limiter
+    return limiter
+
+
+def wait_for_shopify_rest_slot(url):
+    limiter = _get_shopify_rest_limiter(url)
+    if limiter is None:
+        return
+    with limiter["lock"]:
+        now = time.monotonic()
+        target = max(limiter["next_allowed"], limiter["blocked_until"])
+        if target > now:
+            time.sleep(target - now)
+        limiter["next_allowed"] = time.monotonic() + SHOPIFY_REST_MIN_INTERVAL
+
+
+def defer_shopify_rest_store(url, seconds):
+    limiter = _get_shopify_rest_limiter(url)
+    if limiter is None:
+        return
+    with limiter["lock"]:
+        blocked_until = time.monotonic() + max(0.0, seconds)
+        limiter["blocked_until"] = max(limiter["blocked_until"], blocked_until)
+        limiter["next_allowed"] = max(limiter["next_allowed"], limiter["blocked_until"])
 
 DISPUTE_TAG_PATTERN = re.compile(r'^(\d{1,2}\.\d{1,2})(?:截止)?-(.+)$')
 
@@ -99,14 +162,6 @@ def fetch_graphql_dispute_details(session, shop_domain, access_token):
               reason
               networkReasonCode
             }
-            order {
-              id
-              disputes {
-                id
-                initiatedAs
-                status
-              }
-            }
           }
         }
         pageInfo {
@@ -125,9 +180,9 @@ def fetch_graphql_dispute_details(session, shop_domain, access_token):
             json={"query": query, "variables": {"first": 250, "after": cursor}},
             timeout=(10, 45),
         )
-        if not response or response.status_code != 200:
-            status = response.status_code if response else 0
-            body = response.text[:500] if response else "无响应"
+        if response is None or response.status_code != 200:
+            status = response.status_code if response is not None else 0
+            body = response.text[:500] if response is not None else "无响应"
             scope_hint = "；请确认该应用已获 read_shopify_payments_disputes 权限并重新授权" if status in (401, 403) else ""
             raise RuntimeError(f"GraphQL 拒付案件详情查询失败 HTTP {status}: {body}{scope_hint}")
 
@@ -157,22 +212,6 @@ def fetch_graphql_dispute_details(session, shop_domain, access_token):
             dispute_status = str(node.get("status") or "").strip().upper()
             finalized_on = str(node.get("finalizedOn") or "").strip()
 
-            # Order.disputes is the summary displayed on the order itself in Shopify Admin.
-            # Match by GID first; if the order has exactly one dispute, use that sole summary.
-            order_node = node.get("order") or {}
-            order_summaries = order_node.get("disputes") or []
-            matched_summary = next(
-                (summary for summary in order_summaries
-                 if str(summary.get("id") or "").strip() == dispute_gid),
-                None,
-            )
-            if matched_summary is None and len(order_summaries) == 1:
-                matched_summary = order_summaries[0]
-
-            order_summary_type = str((matched_summary or {}).get("initiatedAs") or "").strip().upper()
-            order_summary_status = str((matched_summary or {}).get("status") or "").strip().upper()
-            order_summary_id = str((matched_summary or {}).get("id") or "").strip()
-
             if legacy_id:
                 result[legacy_id] = {
                     "reason": reason,
@@ -181,9 +220,6 @@ def fetch_graphql_dispute_details(session, shop_domain, access_token):
                     "status": dispute_status,
                     "finalized_on": finalized_on,
                     "dispute_gid": dispute_gid,
-                    "order_summary_id": order_summary_id,
-                    "order_summary_type": order_summary_type,
-                    "order_summary_status": order_summary_status,
                 }
 
         page_info = connection.get("pageInfo") or {}
@@ -200,7 +236,8 @@ def fetch_graphql_dispute_details(session, shop_domain, access_token):
 
 
 def log_reason_mismatch(shop_name, shop_domain, dispute_item, rest_reason, graphql_reason, network_code):
-    """Print and persist REST-vs-GraphQL reason discrepancies for later diagnosis."""
+    """Save per-dispute REST-vs-GraphQL reason differences without flooding Actions logs."""
+    increment_audit_counter("reason_source_mismatch")
     entry = {
         "time_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
         "shop_name": shop_name,
@@ -212,7 +249,6 @@ def log_reason_mismatch(shop_name, shop_domain, dispute_item, rest_reason, graph
         "network_reason_code": network_code,
         "selected_reason": graphql_reason,
     }
-    print("⚠️ [拒付原因源不一致] " + json.dumps(entry, ensure_ascii=False))
     try:
         with FILE_LOCK:
             with open("dispute_reason_audit.jsonl", "a", encoding="utf-8") as f:
@@ -222,22 +258,17 @@ def log_reason_mismatch(shop_name, shop_domain, dispute_item, rest_reason, graph
 
 
 def log_dispute_status_audit(shop_name, shop_domain, dispute_item, rest_type,
-                             rest_status, graphql_type, graphql_status, finalized_on,
-                             order_summary_type="", order_summary_status="", selected_type="",
-                             selected_status=""):
-    """Persist status-source differences and statuses that need special handling."""
-    selected_type = selected_type or graphql_type
-    selected_status = selected_status or graphql_status
-    rest_graphql_mismatch = (rest_type != graphql_type) or (rest_status != graphql_status)
-    order_summary_mismatch = (
-        bool(order_summary_type and order_summary_type != graphql_type)
-        or bool(order_summary_status and order_summary_status != graphql_status)
-    )
-    inquiry_lost = selected_type == "INQUIRY" and selected_status == "LOST"
-    prevented = selected_status == "PREVENTED"
-    chargeback_lost = selected_type == "CHARGEBACK" and selected_status == "LOST"
-    if not (rest_graphql_mismatch or order_summary_mismatch or inquiry_lost or prevented or chargeback_lost):
+                             rest_status, graphql_type, graphql_status, finalized_on):
+    """Save only genuine source conflicts or the unusual Inquiry+LOST combination."""
+    source_mismatch = (rest_type != graphql_type) or (rest_status != graphql_status)
+    inquiry_lost = graphql_type == "INQUIRY" and graphql_status == "LOST"
+    if not source_mismatch and not inquiry_lost:
         return
+
+    if source_mismatch:
+        increment_audit_counter("status_source_mismatch")
+    if inquiry_lost:
+        increment_audit_counter("inquiry_lost_review")
 
     entry = {
         "time_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
@@ -249,16 +280,11 @@ def log_dispute_status_audit(shop_name, shop_domain, dispute_item, rest_type,
         "rest_status": rest_status,
         "graphql_type": graphql_type,
         "graphql_status": graphql_status,
-        "order_summary_type": order_summary_type,
-        "order_summary_status": order_summary_status,
         "finalized_on": finalized_on,
-        "selected_type": selected_type,
-        "selected_status": selected_status,
+        "selected_type": graphql_type,
+        "selected_status": graphql_status,
         "inquiry_lost_needs_review": inquiry_lost,
-        "chargeback_lost_needs_review": chargeback_lost,
-        "prevented_status": prevented,
     }
-    print("⚠️ [案件类型/状态核验] " + json.dumps(entry, ensure_ascii=False))
     try:
         with FILE_LOCK:
             with open("dispute_status_audit.jsonl", "a", encoding="utf-8") as f:
@@ -313,38 +339,48 @@ def get_session():
 
 def safe_request(session, method, url, max_retries=5, retry_delay=2, **kwargs):
     kwargs.setdefault("timeout", (10, 30))
-    
+
     headers = kwargs.get("headers", {})
     headers.setdefault("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
     headers.setdefault("Accept", "application/json")
     kwargs["headers"] = headers
 
     last_resp = None
-
     for attempt in range(1, max_retries + 1):
+        wait_for_shopify_rest_slot(url)
         try:
             resp = session.request(method, url, **kwargs)
             last_resp = resp
-            
+
             if resp.status_code == 429:
                 retry_after = resp.headers.get("Retry-After", "2")
                 try:
-                    wait_time = float(retry_after)
-                except ValueError:
+                    wait_time = max(0.0, float(retry_after))
+                except (TypeError, ValueError):
                     wait_time = 2.0
-                time.sleep(wait_time + attempt * 0.5)
-                continue
-            elif resp.status_code in [500, 502, 503, 504]:
+                # Tell all concurrent requests for this same shop to wait too.
+                defer_shopify_rest_store(url, wait_time + 0.1)
                 if attempt < max_retries:
-                    time.sleep(max(0, retry_delay) * attempt)
-                continue
-                
+                    continue
+                return resp
+
+            if resp.status_code in (500, 502, 503, 504):
+                if attempt < max_retries:
+                    time.sleep(max(0.0, retry_delay) * attempt)
+                    continue
+                return resp
+
             return resp
-        except (requests.exceptions.RequestException, Exception) as e:
-            if attempt == max_retries:
-                raise e
-            time.sleep(max(0, retry_delay) * attempt)
-            
+
+        except requests.exceptions.RequestException:
+            if attempt >= max_retries:
+                raise
+            time.sleep(max(0.0, retry_delay) * attempt)
+        except Exception:
+            if attempt >= max_retries:
+                raise
+            time.sleep(max(0.0, retry_delay) * attempt)
+
     return last_resp
 
 def translate_error(error_type, http_status, error_details):
@@ -475,12 +511,10 @@ def _split_order_tags(raw_tags):
 
 
 def sync_order_tags_for_disputes(session, shop_name, shop_domain, access_token, disputes):
-    """Update each order's dispute tags with short retries and a cached-tag fallback.
+    """Merge dispute tags using the order snapshot already fetched for enrichment.
 
-    The order details endpoint was already read while parsing each dispute. If the
-    second, tags-only GET has a transient timeout, use that fresh-enough tag snapshot
-    to build and PUT the merged tags instead of abandoning the update. Orders are
-    processed concurrently to keep total runtime low.
+    Avoid a second GET per order: it doubled REST traffic and contributed to 429s.
+    If no order-detail snapshot exists, do not PUT potentially incomplete tags.
     """
     grouped = {}
     for item in disputes:
@@ -493,54 +527,44 @@ def sync_order_tags_for_disputes(session, shop_name, shop_domain, access_token, 
         return
 
     def process_one_order(order_id, items):
-        url = f"https://{shop_domain}/admin/api/{API_VERSION}/orders/{order_id}.json?fields=id,name,tags"
-        headers = {"X-Shopify-Access-Token": access_token}
+        # Select the most recently completed successful snapshot for this order.
+        loaded_items = [item for item in items if item.get("_order_tags_loaded")]
+        if not loaded_items:
+            increment_audit_counter("tag_write_skipped_no_snapshot")
+            with FILE_LOCK:
+                with open("shopify_tag_write_errors.jsonl", "a", encoding="utf-8") as f:
+                    f.write(json.dumps({
+                        "time_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                        "shop_name": shop_name,
+                        "shop_domain": shop_domain,
+                        "order_id": str(order_id),
+                        "action": "SKIP_PUT_NO_ORDER_SNAPSHOT",
+                        "message": "订单详情未成功读取；为避免覆盖未知标签，不执行 Shopify 标签写回",
+                    }, ensure_ascii=False) + "\n")
+            return "skipped"
 
-        # Cached tags come from get_order_details(), which is already part of the
-        # order-enrichment step. They allow the table and Shopify update to continue
-        # when this additional fresh GET is unavailable.
-        cached_tags = _split_order_tags(items[0].get("order_tags", ""))
-        cache_loaded = bool(items[0].get("_order_tags_loaded", False))
-        order_name = items[0].get("order_name", "N/A")
-        tags_source = "Shopify实时标签"
+        snapshot = loaded_items[-1]
+        order_name = snapshot.get("order_name", "N/A")
+        tags_list = _split_order_tags(snapshot.get("order_tags", ""))
 
-        try:
-            response = safe_request(
-                session, "GET", url, headers=headers,
-                max_retries=2, retry_delay=0.25, timeout=(3, 6)
-            )
-        except Exception as exc:
-            response = None
-            get_error = type(exc).__name__
-        else:
-            get_error = "无响应"
-
-        if response is not None and response.status_code == 200:
-            order_data = response.json().get("order", {})
-            order_name = order_data.get("name", order_name)
-            tags_list = _split_order_tags(order_data.get("tags", ""))
-        else:
-            if not cache_loaded:
-                print(
-                    f"⚠️ [{shop_name}] 订单 {order_id} 实时标签读取失败（{get_error}），"
-                    "且订单详情阶段没有可用标签快照；保留表格案件数据，本次不冒险覆盖 Shopify 标签。"
-                )
-                return
-            tags_list = cached_tags
-            tags_source = "订单详情缓存标签"
-            status_code = response.status_code if response is not None else "无响应"
-            print(
-                f"⚠️ [{shop_name}] 订单 {order_id} 实时标签读取失败（HTTP {status_code}/{get_error}）；"
-                f"改用刚才读取的标签快照继续更新，避免跳过表格标签。"
-            )
+        # If multiple disputes share one order and one detail request failed,
+        # reuse the successful same-order snapshot for all those dispute rows.
+        transferable_fields = (
+            "order_name", "order_amount", "customer_name", "customer_email",
+            "is_refunded", "is_partially_refunded", "refunded_amount",
+            "last_refund_at", "refund_count", "carrier", "tracking_number",
+        )
+        for item in items:
+            if not item.get("_order_tags_loaded"):
+                for field in transferable_fields:
+                    item[field] = snapshot.get(field)
+            item["order_details_loaded"] = True
 
         new_tags_list = process_order_tags_for_disputes(tags_list, items)
-        formatted_tags = "\n".join(new_tags_list)
+        final_tags_list = tags_list
+        tags_changed = set(new_tags_list) != set(tags_list)
 
-        # Always put the intended/current merged value on the outgoing sheet row.
-        # If Shopify PUT later fails, the log makes that explicit; the spreadsheet
-        # still receives the dispute record and the best available tag snapshot.
-        if set(new_tags_list) != set(tags_list):
+        if tags_changed:
             update_url = f"https://{shop_domain}/admin/api/{API_VERSION}/orders/{order_id}.json"
             update_headers = {
                 "X-Shopify-Access-Token": access_token,
@@ -550,31 +574,50 @@ def sync_order_tags_for_disputes(session, shop_name, shop_domain, access_token, 
             try:
                 update_response = safe_request(
                     session, "PUT", update_url, headers=update_headers, json=payload,
-                    max_retries=2, retry_delay=0.25, timeout=(3, 6)
+                    max_retries=3, retry_delay=0.25, timeout=(5, 12)
                 )
+                update_error = ""
             except Exception as exc:
                 update_response = None
-                update_error = type(exc).__name__
-            else:
-                update_error = "无响应"
+                update_error = f"{type(exc).__name__}: {str(exc)[:160]}"
 
-            if not update_response or update_response.status_code != 200:
-                status_code = update_response.status_code if update_response else "无响应"
-                print(
-                    f"⚠️ [{shop_name}] 订单 {order_name} 标签写回 Shopify 失败，HTTP {status_code}/{update_error}；"
-                    "案件和合并后的标签仍会推送到表格，下一轮同步会再次尝试 Shopify 标签写回。"
-                )
+            if update_response is not None and update_response.status_code == 200:
+                final_tags_list = new_tags_list
+                write_failed = False
             else:
-                print(
-                    f"***{shop_name}*** 订单 {order_name} 标签已更新（来源：{tags_source}）："
-                    f"{', '.join(new_tags_list)}"
-                )
+                increment_audit_counter("tag_write_failure")
+                status_code = update_response.status_code if update_response is not None else "无HTTP响应"
+                response_snippet = update_response.text[:160] if update_response is not None else ""
+                with FILE_LOCK:
+                    with open("shopify_tag_write_errors.jsonl", "a", encoding="utf-8") as f:
+                        f.write(json.dumps({
+                            "time_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                            "shop_name": shop_name,
+                            "shop_domain": shop_domain,
+                            "order_id": str(order_id),
+                            "order_name": order_name,
+                            "action": "PUT_TAGS_FAILED",
+                            "http_status": status_code,
+                            "error": update_error,
+                            "response": response_snippet,
+                        }, ensure_ascii=False) + "\n")
+                # Keep the sheet's order_tags field aligned with the last known Shopify snapshot,
+                # not the unconfirmed value that failed to write back.
+                final_tags_list = tags_list
+                write_failed = True
         else:
-            print(f"[{shop_name}] 订单 {order_name} 标签无需变更。")
+            write_failed = False
 
+        formatted_tags = "\n".join(final_tags_list)
         for item in items:
             item["order_tags"] = formatted_tags
+            item["order_details_loaded"] = True
 
+        if write_failed:
+            return "write_failed"
+        return "updated" if tags_changed else "unchanged"
+
+    counts = {"updated": 0, "unchanged": 0, "write_failed": 0, "skipped": 0, "exception": 0}
     max_workers = min(MAX_ORDER_WORKERS, len(grouped))
     with ThreadPoolExecutor(max_workers=max_workers) as tag_executor:
         futures = [
@@ -583,19 +626,29 @@ def sync_order_tags_for_disputes(session, shop_name, shop_domain, access_token, 
         ]
         for future in as_completed(futures):
             try:
-                future.result()
+                result = future.result()
+                counts[result] = counts.get(result, 0) + 1
             except Exception as exc:
+                counts["exception"] += 1
                 print(f"⚠️ [{shop_name}] 订单标签并发处理异常: {type(exc).__name__}: {exc}")
 
-    _strip_internal_dispute_fields(disputes)
+    if any(counts.values()):
+        print(
+            f"[{shop_name}] 标签同步汇总：订单 {len(grouped)} 个；"
+            f"写回成功 {counts['updated']} 个；无需变更 {counts['unchanged']} 个；"
+            f"写回失败 {counts['write_failed']} 个；缺少详情快照而安全跳过 {counts['skipped']} 个；"
+            f"异常 {counts['exception']} 个。"
+        )
 
+    _strip_internal_dispute_fields(disputes)
 
 def _strip_internal_dispute_fields(disputes):
     """Remove internal-only values before sending dispute rows to GAS."""
     internal_keys = (
         "_order_id", "_raw_reason", "_evidence_due_date", "_initiated_at",
         "_rest_type", "_rest_status", "_graphql_type", "_graphql_status",
-        "_order_summary_type", "_order_summary_status", "_finalized_on",
+        "_order_summary_type", "_order_summary_status", "_network_reason_code", "_rest_reason",
+        "_finalized_on",
         "_successful_refund_transactions", "_order_tags_loaded",
     )
     for item in disputes:
@@ -642,7 +695,7 @@ def get_access_token(session, store, cache):
     
     try:
         resp = safe_request(session, "POST", token_url, json=payload)
-        if resp and resp.status_code == 200:
+        if resp is not None and resp.status_code == 200:
             token_data = resp.json()
             access_token = token_data.get("access_token")
             if access_token:
@@ -704,7 +757,7 @@ def calculate_successful_refunds(refunds, expected_currency=""):
     return float(total.quantize(Decimal("0.01"))), successful_transaction_count, latest_refund_at
 
 def get_order_details(session, shop_name, shop_domain, access_token, order_id, evidence_due_date="", raw_reason=""):
-    """只读取订单信息，不在并发案件线程里修改订单标签。"""
+    """Read order enrichment fields once; return a loaded flag for safe sheet preservation."""
     if not order_id:
         return "N/A", 0.0, "N/A", "N/A", [], "", "无", "无", False
 
@@ -713,9 +766,9 @@ def get_order_details(session, shop_name, shop_domain, access_token, order_id, e
     try:
         res = safe_request(
             session, "GET", url, headers=headers,
-            max_retries=2, retry_delay=0.25, timeout=(5, 10)
+            max_retries=3, retry_delay=0.25, timeout=(5, 10)
         )
-        if res and res.status_code == 200:
+        if res is not None and res.status_code == 200:
             ord_data = res.json().get("order", {})
             order_name = ord_data.get("name", "N/A")
 
@@ -732,7 +785,7 @@ def get_order_details(session, shop_name, shop_domain, access_token, order_id, e
             refunds = ord_data.get("refunds", [])
 
             raw_tags = ord_data.get("tags", "") or ""
-            tags_list = [tag.strip() for tag in raw_tags.split(",") if tag.strip()]
+            tags_list = _split_order_tags(raw_tags)
             formatted_tags = "\n".join(tags_list)
 
             fulfillments = ord_data.get("fulfillments", [])
@@ -756,12 +809,50 @@ def get_order_details(session, shop_name, shop_domain, access_token, order_id, e
             return (order_name, order_total, cust_name, cust_email, refunds,
                     formatted_tags, carrier_str, tracking_str, True)
 
-        if res:
-            print(f"⚠️ [{shop_name}] 获取订单 {order_id} 详情失败，HTTP {res.status_code}: {res.text[:200]}")
+        if res is not None:
+            status_code = res.status_code
+            response_headers = res.headers or {}
+            issue = {
+                "time_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                "shop_name": shop_name,
+                "shop_domain": shop_domain,
+                "order_id": str(order_id),
+                "stage": "GET_ORDER_DETAILS",
+                "http_status": status_code,
+                "retry_after": response_headers.get("Retry-After", ""),
+                "api_call_limit": response_headers.get("X-Shopify-Shop-Api-Call-Limit", ""),
+                "request_id": response_headers.get("X-Request-ID", ""),
+                "response": (res.text or "")[:180],
+            }
         else:
-            print(f"⚠️ [{shop_name}] 获取订单 {order_id} 详情无响应；保留案件基础信息继续同步。")
+            issue = {
+                "time_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                "shop_name": shop_name,
+                "shop_domain": shop_domain,
+                "order_id": str(order_id),
+                "stage": "GET_ORDER_DETAILS",
+                "http_status": None,
+                "exception": "safe_request returned no response",
+            }
+        increment_audit_counter("order_detail_read_failure")
+        with FILE_LOCK:
+            with open("shopify_order_read_errors.jsonl", "a", encoding="utf-8") as f:
+                f.write(json.dumps(issue, ensure_ascii=False) + "\n")
+
     except Exception as exc:
-        print(f"[{shop_name}] 获取订单 {order_id} 详情异常: {exc}")
+        increment_audit_counter("order_detail_read_failure")
+        issue = {
+            "time_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+            "shop_name": shop_name,
+            "shop_domain": shop_domain,
+            "order_id": str(order_id),
+            "stage": "GET_ORDER_DETAILS",
+            "exception": type(exc).__name__,
+            "error": str(exc)[:180],
+        }
+        with FILE_LOCK:
+            with open("shopify_order_read_errors.jsonl", "a", encoding="utf-8") as f:
+                f.write(json.dumps(issue, ensure_ascii=False) + "\n")
 
     return "N/A", 0.0, "N/A", "N/A", [], "", "无", "无", False
 
@@ -810,9 +901,9 @@ def fetch_disputes_for_shop(store, token_cache):
         while url:
             response = safe_request(session, "GET", url, headers=headers)
             
-            if not response or response.status_code != 200:
-                status_code = response.status_code if response else 0
-                err_details = response.text[:200] if response else "网络连接超时或响应为空"
+            if response is None or response.status_code != 200:
+                status_code = response.status_code if response is not None else 0
+                err_details = response.text[:200] if response is not None else "网络连接超时或响应为空"
                 explanation = translate_error("HTTPError", status_code, err_details)
                 error_logs.append({
                     "time": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
@@ -876,19 +967,11 @@ def fetch_disputes_for_shop(store, token_cache):
                 graphql_type = canonical["type"]
                 graphql_status = canonical["status"]
                 finalized_on = canonical.get("finalized_on", "")
-                order_summary_type = canonical.get("order_summary_type", "")
-                order_summary_status = canonical.get("order_summary_status", "")
-
-                # The order-level summary is queried from the same Shopify order shown in Admin.
-                # Prefer it only when it was safely matched to this dispute (or it is the sole dispute).
-                selected_type = order_summary_type or graphql_type
-                selected_status = order_summary_status or graphql_status
-                if order_summary_status and order_summary_status != graphql_status:
-                    print(
-                        f"⚠️ [订单摘要与Dispute状态不一致] 店铺={shop_name} 案件ID={dispute_id} "
-                        f"Dispute={graphql_type}/{graphql_status} "
-                        f"OrderSummary={order_summary_type}/{order_summary_status}；采用订单摘要状态"
-                    )
+                # Use the exact ShopifyPaymentsDispute node as the current case source.
+                # OrderDisputeSummary.initiatedAs describes the initial type and must not
+                # overwrite Dispute.type after an inquiry escalates to a chargeback.
+                selected_type = graphql_type
+                selected_status = graphql_status
 
                 if (rest_reason and rest_reason != graphql_reason) or dispute_id in REASON_AUDIT_TARGET_IDS:
                     log_reason_mismatch(
@@ -898,8 +981,7 @@ def fetch_disputes_for_shop(store, token_cache):
 
                 log_dispute_status_audit(
                     shop_name, shop_domain, dispute_item,
-                    rest_type, rest_status, graphql_type, graphql_status, finalized_on,
-                    order_summary_type, order_summary_status, selected_type, selected_status
+                    rest_type, rest_status, graphql_type, graphql_status, finalized_on
                 )
 
                 dispute_item["_rest_reason"] = rest_reason
@@ -907,16 +989,45 @@ def fetch_disputes_for_shop(store, token_cache):
                 dispute_item["_rest_status"] = rest_status
                 dispute_item["_graphql_type"] = graphql_type
                 dispute_item["_graphql_status"] = graphql_status
-                dispute_item["_order_summary_type"] = order_summary_type
-                dispute_item["_order_summary_status"] = order_summary_status
                 dispute_item["_finalized_on"] = finalized_on
                 dispute_item["reason"] = graphql_reason
                 dispute_item["type"] = selected_type
                 dispute_item["status"] = selected_status
                 dispute_item["network_reason_code"] = network_code
 
-        # 店铺内部订单详情抓取引入并发池优化
+        # 每个 Shopify 订单本轮只读取一次详情；同订单存在多个案件时共享同一份快照。
+        # 这能避免同一订单重复 GET，减少 Shopify REST 请求量和 429 风险。
+        order_details_by_id = {}
         if raw_dispute_items:
+            unique_order_ids = sorted({
+                str(item.get("order_id"))
+                for item in raw_dispute_items
+                if item.get("order_id")
+            })
+
+            if unique_order_ids:
+                order_fetch_workers = min(MAX_ORDER_WORKERS, len(unique_order_ids))
+                with ThreadPoolExecutor(max_workers=order_fetch_workers) as details_executor:
+                    detail_futures = {
+                        details_executor.submit(
+                            get_order_details,
+                            session, shop_name, shop_domain, access_token, order_id
+                        ): order_id
+                        for order_id in unique_order_ids
+                    }
+                    for future in as_completed(detail_futures):
+                        order_id = detail_futures[future]
+                        try:
+                            order_details_by_id[order_id] = future.result()
+                        except Exception as detail_exc:
+                            print(
+                                f"[{shop_name}] 订单详情任务异常（订单 {order_id}）："
+                                f"{type(detail_exc).__name__}: {str(detail_exc)[:120]}"
+                            )
+                            order_details_by_id[order_id] = (
+                                "N/A", 0.0, "N/A", "N/A", [], "", "无", "无", False
+                            )
+
             def process_single_dispute(d):
                 dispute_id = str(d["id"])
                 raw_type = str(d.get("type") or d.get("_graphql_type") or "CHARGEBACK").upper()
@@ -931,11 +1042,18 @@ def fetch_disputes_for_shop(store, token_cache):
                 unique_key = f"{shop_domain}|{dispute_id}"
                 order_id = d.get("order_id")
                 
+                if order_id:
+                    order_detail_snapshot = order_details_by_id.get(str(order_id))
+                else:
+                    order_detail_snapshot = None
+
+                if order_detail_snapshot is None:
+                    order_detail_snapshot = (
+                        "N/A", 0.0, "N/A", "N/A", [], "", "无", "无", False
+                    )
+
                 (order_name, order_total, cust_name, cust_email,
-                 refunds, order_tags, carrier, tracking_number, order_tags_loaded) = get_order_details(
-                    session, shop_name, shop_domain, access_token, order_id, 
-                    evidence_due_date=evidence_due_date, raw_reason=raw_reason
-                 )
+                 refunds, order_tags, carrier, tracking_number, order_tags_loaded) = order_detail_snapshot
                 
                 refund_count = len(refunds)  # Shopify Refund 记录数，保持原表格口径
                 total_refunded, successful_refund_txn_count, last_refund_at = calculate_successful_refunds(
@@ -981,6 +1099,7 @@ def fetch_disputes_for_shop(store, token_cache):
                     "last_refund_at": last_refund_at,
                     "refund_count": refund_count,
                     "order_tags": order_tags,
+                    "order_details_loaded": bool(order_tags_loaded),
                     "carrier": carrier,
                     "tracking_number": tracking_number,
                     "_order_id": order_id,
@@ -992,24 +1111,27 @@ def fetch_disputes_for_shop(store, token_cache):
                     "_rest_status": str(d.get("_rest_status", "") or ""),
                     "_graphql_type": str(d.get("_graphql_type", "") or ""),
                     "_graphql_status": str(d.get("_graphql_status", "") or ""),
-                    "_order_summary_type": str(d.get("_order_summary_type", "") or ""),
-                    "_order_summary_status": str(d.get("_order_summary_status", "") or ""),
                     "_finalized_on": str(d.get("_finalized_on", "") or ""),
                     "_successful_refund_transactions": successful_refund_txn_count,
                     "_evidence_due_date": evidence_due_date,
                     "_initiated_at": d.get("initiated_at", "")
                 }
 
-            with ThreadPoolExecutor(max_workers=MAX_ORDER_WORKERS) as order_executor:
-                futures = [order_executor.submit(process_single_dispute, item) for item in raw_dispute_items]
-                for future in as_completed(futures):
-                    try:
-                        parsed_disputes.append(future.result())
-                    except Exception as sub_e:
-                        print(f"[{shop_name}] 处理单条拒付解析异常: {sub_e}")
+            # 订单详情已按唯一 order_id 并发读取；这里仅做本地字段转换，不再发 API 请求。
+            for item in raw_dispute_items:
+                try:
+                    parsed_disputes.append(process_single_dispute(item))
+                except Exception as sub_e:
+                    print(f"[{shop_name}] 处理单条拒付解析异常：{type(sub_e).__name__}: {str(sub_e)[:160]}")
 
             # 先独立解析每条案件，再按订单聚合标签；避免同订单多个案件并发覆盖。
             sync_order_tags_for_disputes(session, shop_name, shop_domain, access_token, parsed_disputes)
+            unresolved_details = sum(1 for item in parsed_disputes if not item.get("order_details_loaded", False))
+            if unresolved_details:
+                print(
+                    f"[{shop_name}] 本轮有 {unresolved_details} 条案件未能取得订单详情快照；"
+                    "旧表格中的订单补充字段将保留，具体订单和 HTTP 状态见诊断文件。"
+                )
 
     except Exception as e:
         err_details = str(e)[:200]
@@ -1067,7 +1189,7 @@ def post_to_gas(session, action, item_key, item_list, batch_size=500, max_retrie
                 res = None
                 print(f"[{action}] GAS 请求异常（第 {attempt}/{max_retries} 次）：{type(exc).__name__}: {exc}")
 
-            if res and res.status_code == 200:
+            if res is not None and res.status_code == 200:
                 try:
                     res_json = res.json()
                     if res_json.get("status") == "success":
@@ -1095,7 +1217,7 @@ def post_to_gas(session, action, item_key, item_list, batch_size=500, max_retrie
             else:
                 wait = 3 * attempt
                 if attempt < max_retries:
-                    print(f"[{action}] 推送异常 (Status: {res.status_code if res else 'None'})，等待 {wait} 秒后重试 (第 {attempt}/{max_retries} 次)...")
+                    print(f"[{action}] 推送异常 (Status: {res.status_code if res is not None else '无HTTP响应'})，等待 {wait} 秒后重试 (第 {attempt}/{max_retries} 次)...")
                     time.sleep(wait)
                 
         if not success:
@@ -1131,6 +1253,27 @@ def main():
             all_error_logs.extend(error_logs)
 
     print(f"抓取结束：累计提取 {len(all_disputes)} 条拒付/查询案件，异常记录 {len(all_error_logs)} 条。")
+    if all_error_logs:
+        print("[店铺/API异常明细] 以下异常已同时写入 LOG_ERROR：")
+        for err in all_error_logs:
+            print(
+                f"[API异常] 店铺={err.get('shop_name', '')} "
+                f"接口={err.get('api', '')} HTTP={err.get('http_status', '')} "
+                f"类型={err.get('error_type', '')} "
+                f"详情={str(err.get('error_details', ''))[:160]}"
+            )
+
+    with COUNTER_LOCK:
+        audit_snapshot = dict(AUDIT_COUNTERS)
+    print(
+        "[异常汇总] "
+        f"订单详情读取失败={audit_snapshot.get('order_detail_read_failure', 0)}；"
+        f"标签写回失败={audit_snapshot.get('tag_write_failure', 0)}；"
+        f"因缺少订单快照而跳过标签写回={audit_snapshot.get('tag_write_skipped_no_snapshot', 0)}；"
+        f"REST/GraphQL原因差异={audit_snapshot.get('reason_source_mismatch', 0)}；"
+        f"REST/GraphQL案件状态差异={audit_snapshot.get('status_source_mismatch', 0)}；"
+        f"查询+LOST待核实={audit_snapshot.get('inquiry_lost_review', 0)}。"
+    )
 
     session = get_session()
     
