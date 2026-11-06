@@ -52,5 +52,6 @@ jobs:
             dispute_status_audit.jsonl
             shopify_order_read_errors.jsonl
             shopify_tag_write_errors.jsonl
+            shopify_scope_audit.jsonl
           if-no-files-found: ignore
           retention-days: 7
