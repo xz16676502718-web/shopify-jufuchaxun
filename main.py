@@ -30,7 +30,13 @@ AUDIT_COUNTERS = {
     "order_detail_read_failure": 0,
     "tag_write_failure": 0,
     "tag_write_skipped_no_snapshot": 0,
+    "stores_missing_read_all_orders": 0,
+    "stores_missing_read_orders": 0,
+    "stores_scope_unknown": 0,
 }
+
+SCOPE_AUDIT_LOCK = threading.Lock()
+SCOPE_AUDIT_RESULTS = {}
 
 # Shopify REST Admin API default standard rate is 2 requests/second per app/store.
 # Keep each store below that rate; stores are throttled independently, so other stores continue.
@@ -676,23 +682,105 @@ def save_token_cache(cache):
         except Exception as e:
             print(f"写入 Token 缓存文件失败: {e}")
 
+def parse_shopify_scopes(scope_value):
+    """Parse Shopify's token-response scope string into a normalized set."""
+    if isinstance(scope_value, (list, tuple, set)):
+        parts = [str(x).strip() for x in scope_value]
+    else:
+        parts = re.split(r"[,\s]+", str(scope_value or "").strip())
+    return {part for part in parts if part}
+
+
+def fetch_granted_scopes_fallback(session, shop_domain, access_token):
+    """Fallback only when the token response omits its documented scope field."""
+    url = f"https://{shop_domain}/admin/oauth/access_scopes.json"
+    headers = {"X-Shopify-Access-Token": access_token}
+    try:
+        response = safe_request(
+            session, "GET", url, headers=headers,
+            max_retries=2, retry_delay=0.25, timeout=(5, 10)
+        )
+        if response is not None and response.status_code == 200:
+            items = (response.json() or {}).get("access_scopes") or []
+            return ",".join(
+                str(item.get("handle") or "").strip()
+                for item in items if item.get("handle")
+            ), "access_scopes_endpoint"
+        return "", f"access_scopes_http_{response.status_code if response is not None else 'no_response'}"
+    except Exception as exc:
+        return "", f"access_scopes_error_{type(exc).__name__}"
+
+
+def record_shopify_scope_audit(shop_name, shop_domain, scope_value, source="token_response"):
+    scopes = parse_shopify_scopes(scope_value)
+    known = bool(scopes)
+    has_read_orders = "read_orders" in scopes or "write_orders" in scopes
+    has_read_all_orders = "read_all_orders" in scopes
+    result = {
+        "time_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+        "shop_name": shop_name,
+        "shop_domain": shop_domain,
+        "scope_source": source,
+        "scope_known": known,
+        "has_read_orders_or_write_orders": has_read_orders,
+        "has_read_all_orders": has_read_all_orders,
+        "can_read_orders_older_than_60_days": bool(has_read_orders and has_read_all_orders),
+        "has_read_shopify_payments_disputes": "read_shopify_payments_disputes" in scopes,
+        "granted_scope_count": len(scopes),
+        "granted_scopes": sorted(scopes),
+    }
+    with SCOPE_AUDIT_LOCK:
+        SCOPE_AUDIT_RESULTS[shop_domain] = result
+    try:
+        with FILE_LOCK:
+            with open("shopify_scope_audit.jsonl", "a", encoding="utf-8") as f:
+                f.write(json.dumps(result, ensure_ascii=False) + "\n")
+    except Exception as exc:
+        print(f"⚠️ [{shop_name}] Shopify 权限诊断日志写入失败: {exc}")
+
+
+def audit_cached_or_new_scope(session, shop_name, shop_domain, access_token, scope_value, source):
+    if not str(scope_value or "").strip():
+        fallback_value, fallback_source = fetch_granted_scopes_fallback(
+            session, shop_domain, access_token
+        )
+        if fallback_value:
+            scope_value = fallback_value
+            source = fallback_source
+        else:
+            source = fallback_source
+    record_shopify_scope_audit(shop_name, shop_domain, scope_value, source)
+    return str(scope_value or "")
+
+
 def get_access_token(session, store, cache):
     domain = store["domain"]
     client_id = store["client_id"]
     client_secret = store["client_secret"]
     shop_name = store.get("name", domain)
 
-    # Client Credentials access tokens expire after expires_in (normally 24 hours).
-    # Old cache entries without expires_at are intentionally refreshed once.
+    # Client Credentials tokens inherit the scopes already granted to this app
+    # installation. A token cached before read_all_orders was approved must not
+    # mask the new grant, so cached tokens are reused only when their scope record
+    # includes read_all_orders; otherwise exchange a fresh token and audit it.
     cached = cache.get(domain) or {}
     cached_token = cached.get("access_token")
     expires_at = float(cached.get("expires_at", 0) or 0)
-    if cached_token and expires_at > time.time() + 300:
+    cached_scope = str(cached.get("scope") or "")
+    cached_scopes = parse_shopify_scopes(cached_scope)
+    if cached_token and expires_at > time.time() + 300 and "read_all_orders" in cached_scopes:
+        audit_cached_or_new_scope(
+            session, shop_name, domain, cached_token, cached_scope, "token_cache"
+        )
         return cached_token
 
     token_url = f"https://{domain}/admin/oauth/access_token"
-    payload = {"client_id": client_id, "client_secret": client_secret, "grant_type": "client_credentials"}
-    
+    payload = {
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "grant_type": "client_credentials",
+    }
+
     try:
         resp = safe_request(session, "POST", token_url, json=payload)
         if resp is not None and resp.status_code == 200:
@@ -700,15 +788,26 @@ def get_access_token(session, store, cache):
             access_token = token_data.get("access_token")
             if access_token:
                 expires_in = int(token_data.get("expires_in", 86399) or 86399)
+                granted_scope = str(token_data.get("scope") or "")
+                granted_scope = audit_cached_or_new_scope(
+                    session, shop_name, domain, access_token, granted_scope, "token_response"
+                )
                 cache[domain] = {
                     "access_token": access_token,
                     "expires_at": time.time() + expires_in,
+                    "scope": granted_scope,
                 }
                 save_token_cache(cache)
                 return access_token
+            print(f"[{shop_name}] Token 接口返回 200，但没有 access_token")
+        elif resp is not None:
+            print(f"[{shop_name}] Token 获取失败 HTTP {resp.status_code}: {(resp.text or '')[:180]}")
     except Exception as e:
-        print(f"[{shop_name}] 请求 Token 异常: {e}")
-        
+        print(f"[{shop_name}] 请求 Token 异常: {type(e).__name__}: {str(e)[:180]}")
+
+    # Record the store as unaudited when token exchange fails; this distinguishes
+    # authentication failures from a valid token that simply lacks read_all_orders.
+    record_shopify_scope_audit(shop_name, domain, "", "token_exchange_failed")
     return None
 
 
@@ -823,6 +922,11 @@ def get_order_details(session, shop_name, shop_domain, access_token, order_id, e
                 "api_call_limit": response_headers.get("X-Shopify-Shop-Api-Call-Limit", ""),
                 "request_id": response_headers.get("X-Request-ID", ""),
                 "response": (res.text or "")[:180],
+                "diagnostic_hint": (
+                    "若该订单创建时间超过60天且Token缺少read_all_orders，可能是历史订单访问范围限制；"
+                    "若已授予read_all_orders仍返回404，请核对order_id是否属于该店铺、订单是否存在及当前应用安装。"
+                    if status_code == 404 else ""
+                ),
             }
         else:
             issue = {
@@ -1253,6 +1357,25 @@ def main():
             all_error_logs.extend(error_logs)
 
     print(f"抓取结束：累计提取 {len(all_disputes)} 条拒付/查询案件，异常记录 {len(all_error_logs)} 条。")
+
+    with SCOPE_AUDIT_LOCK:
+        scope_results = list(SCOPE_AUDIT_RESULTS.values())
+    missing_all_orders = [r for r in scope_results if r.get("scope_known") and not r.get("has_read_all_orders")]
+    missing_read_orders = [r for r in scope_results if r.get("scope_known") and not r.get("has_read_orders_or_write_orders")]
+    unknown_scope = [r for r in scope_results if not r.get("scope_known")]
+    print(
+        f"[Shopify 权限核验] 已检查 {len(scope_results)} 家店铺；"
+        f"缺少 read_all_orders={len(missing_all_orders)} 家；"
+        f"缺少 read_orders/write_orders={len(missing_read_orders)} 家；"
+        f"权限信息未知={len(unknown_scope)} 家。"
+    )
+    if missing_all_orders:
+        print("[历史订单权限缺失] " + ", ".join(r["shop_name"] for r in missing_all_orders))
+    if missing_read_orders:
+        print("[订单基础读取权限缺失] " + ", ".join(r["shop_name"] for r in missing_read_orders))
+    if unknown_scope:
+        print("[权限核验未取得结果] " + ", ".join(r["shop_name"] for r in unknown_scope))
+
     if all_error_logs:
         print("[店铺/API异常明细] 以下异常已同时写入 LOG_ERROR：")
         for err in all_error_logs:
