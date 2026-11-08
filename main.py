@@ -22,6 +22,8 @@ MAX_STORE_WORKERS = 10  # 店铺级并发数（从 3 提升至 10）
 MAX_ORDER_WORKERS = 4   # 单店内部订单详情并发数
 
 FILE_LOCK = threading.Lock()
+TOKEN_FAILURES_LOCK = threading.Lock()
+TOKEN_FAILURES = {}  # domain -> actual OAuth failure details for the current run
 COUNTER_LOCK = threading.Lock()
 AUDIT_COUNTERS = {
     "reason_source_mismatch": 0,
@@ -725,7 +727,7 @@ def record_shopify_scope_audit(shop_name, shop_domain, scope_value, source="toke
         "has_read_orders_or_write_orders": has_read_orders,
         "has_read_all_orders": has_read_all_orders,
         "can_read_orders_older_than_60_days": bool(has_read_orders and has_read_all_orders),
-        "has_read_shopify_payments_disputes": "read_shopify_payments_disputes" in scopes,
+        "has_read_shopify_payments_disputes": ("read_shopify_payments_disputes" in scopes or "write_shopify_payments_disputes" in scopes),
         "granted_scope_count": len(scopes),
         "granted_scopes": sorted(scopes),
     }
@@ -754,15 +756,15 @@ def audit_cached_or_new_scope(session, shop_name, shop_domain, access_token, sco
 
 
 def get_access_token(session, store, cache):
-    domain = store["domain"]
+    domain = str(store["domain"]).strip().lower()
     client_id = store["client_id"]
     client_secret = store["client_secret"]
     shop_name = store.get("name", domain)
 
-    # Client Credentials tokens inherit the scopes already granted to this app
-    # installation. A token cached before read_all_orders was approved must not
-    # mask the new grant, so cached tokens are reused only when their scope record
-    # includes read_all_orders; otherwise exchange a fresh token and audit it.
+    # Clear any prior failure record for this store in the current run.
+    with TOKEN_FAILURES_LOCK:
+        TOKEN_FAILURES.pop(domain, None)
+
     cached = cache.get(domain) or {}
     cached_token = cached.get("access_token")
     expires_at = float(cached.get("expires_at", 0) or 0)
@@ -799,14 +801,36 @@ def get_access_token(session, store, cache):
                 }
                 save_token_cache(cache)
                 return access_token
+
+            failure = {
+                "http_status": 200,
+                "error_type": "TokenResponseError",
+                "error_details": "Token endpoint returned HTTP 200 without access_token",
+            }
             print(f"[{shop_name}] Token 接口返回 200，但没有 access_token")
         elif resp is not None:
+            failure = {
+                "http_status": int(resp.status_code),
+                "error_type": "OAuthHTTPError",
+                "error_details": (resp.text or "")[:500] or f"HTTP {resp.status_code}",
+            }
             print(f"[{shop_name}] Token 获取失败 HTTP {resp.status_code}: {(resp.text or '')[:180]}")
-    except Exception as e:
-        print(f"[{shop_name}] 请求 Token 异常: {type(e).__name__}: {str(e)[:180]}")
+        else:
+            failure = {
+                "http_status": 0,
+                "error_type": "OAuthNoResponse",
+                "error_details": "Token endpoint returned no HTTP response",
+            }
+    except Exception as exc:
+        failure = {
+            "http_status": 0,
+            "error_type": type(exc).__name__,
+            "error_details": str(exc)[:500],
+        }
+        print(f"[{shop_name}] 请求 Token 异常: {type(exc).__name__}: {str(exc)[:180]}")
 
-    # Record the store as unaudited when token exchange fails; this distinguishes
-    # authentication failures from a valid token that simply lacks read_all_orders.
+    with TOKEN_FAILURES_LOCK:
+        TOKEN_FAILURES[domain] = failure
     record_shopify_scope_audit(shop_name, domain, "", "token_exchange_failed")
     return None
 
@@ -970,16 +994,22 @@ def fetch_disputes_for_shop(store, token_cache):
     error_logs = []
     
     if not access_token:
-        err_msg = "无法通过 Client ID/Secret 换取 Access Token"
-        explanation = translate_error("AuthError", 401, err_msg)
+        with TOKEN_FAILURES_LOCK:
+            failure = dict(TOKEN_FAILURES.get(str(shop_domain).strip().lower()) or {})
+        http_status = int(failure.get("http_status", 0) or 0)
+        error_type = failure.get("error_type", "OAuthTokenError")
+        details = failure.get("error_details", "Token exchange failed without a recorded response")
+        err_msg = f"Client Credentials Token 获取失败（HTTP {http_status or '无响应'}）：{details[:240]}"
+        explanation = translate_error(error_type, http_status, details)
+        failed_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         error_logs.append({
-            "time": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+            "time": failed_at,
             "shop_name": shop_name,
             "shop_domain": shop_domain,
             "api": "OAuth Token Exchange",
-            "http_status": 401,
-            "error_type": "AuthError",
-            "error_details": err_msg,
+            "http_status": http_status,
+            "error_type": error_type,
+            "error_details": details[:500],
             "retry_count": 5,
             "error_explanation": explanation
         })
@@ -987,7 +1017,7 @@ def fetch_disputes_for_shop(store, token_cache):
             "shop_name": shop_name,
             "shop_domain": shop_domain,
             "last_success_at": "",
-            "last_failed_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+            "last_failed_at": failed_at,
             "fail_count": 1,
             "disputes_fetched": 0,
             "status_changed": 0,
