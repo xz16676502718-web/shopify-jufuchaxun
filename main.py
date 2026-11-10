@@ -316,8 +316,8 @@ STATUS_MAP = {
 }
 
 INQUIRY_STATUS_MAP = {
-    "NEEDS_RESPONSE": "查询待回复",
-    "UNDER_REVIEW": "查询处理中",
+    "NEEDS_RESPONSE": "查询未解决",
+    "UNDER_REVIEW": "查询证据已提交",
     "CHARGE_REFUNDED": "查询已退款关闭",
     "ACCEPTED": "查询已接受并关闭",
     "WON": "查询已关闭（平台标记胜诉）",
