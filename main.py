@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import html
 import time
 import threading
 import requests
@@ -29,6 +30,7 @@ AUDIT_COUNTERS = {
     "reason_source_mismatch": 0,
     "status_source_mismatch": 0,
     "inquiry_lost_review": 0,
+    "admin_alert_status_override": 0,
     "order_detail_read_failure": 0,
     "tag_write_failure": 0,
     "tag_write_skipped_no_snapshot": 0,
@@ -143,6 +145,60 @@ def normalize_reason_code(value):
     return aliases.get(value, value)
 
 
+def _clean_shopify_alert_text(value):
+    """Convert Shopify ResourceAlert HTML/text to readable plain text."""
+    text = html.unescape(str(value or ""))
+    text = re.sub(r"<\s*br\s*/?\s*>", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"</\s*(p|div|li)\s*>", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"<[^>]+>", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def select_shopify_admin_dispute_alert(raw_type, raw_status, alerts):
+    """Return an exact Shopify Orders-page dispute alert only when clearly relevant.
+
+    Order.alerts is a list of order-level messages, not a guaranteed one-to-one
+    dispute status field. Therefore only explicit dispute-related alert text may
+    override the enum translation; generic order alerts are ignored.
+    """
+    raw_type = str(raw_type or "").strip().upper()
+    raw_status = str(raw_status or "").strip().upper()
+    if raw_type != "CHARGEBACK":
+        return "", ""
+
+    dispute_terms = ("拒付", "争议", "chargeback", "dispute")
+    explicit_withdrawal_terms = (
+        "已被撤销", "拒付已撤销", "争议已撤销", "客户撤销",
+        "dispute was withdrawn", "withdrawn the dispute",
+        "chargeback was reversed", "reversed the chargeback",
+        "withdrawn by the customer", "customer withdrew",
+    )
+
+    candidates = []
+    for alert in alerts or []:
+        if not isinstance(alert, dict):
+            continue
+        title = _clean_shopify_alert_text(alert.get("title", ""))
+        content = _clean_shopify_alert_text(alert.get("content", ""))
+        combined = " ".join(part for part in (title, content) if part).strip()
+        lowered = combined.casefold()
+        if not combined or not any(term in lowered for term in dispute_terms):
+            continue
+        candidates.append((title, content, combined, lowered))
+
+    # WON alone is not proof of customer withdrawal. Require explicit withdrawal
+    # language from Shopify's own order alert before using that exact wording.
+    if raw_status == "WON":
+        for title, content, combined, lowered in candidates:
+            if any(term in lowered for term in explicit_withdrawal_terms):
+                # Prefer Shopify's secondary alert text, which is the full sentence
+                # shown in the green banner; fall back to its title if content is empty.
+                return (content or title or combined), "ORDER_ALERT_EXPLICIT_WITHDRAWAL"
+
+    # For other cases, do not replace the API status with a generic order alert.
+    return "", ""
+
+
 def fetch_graphql_dispute_details(session, shop_domain, access_token):
     """Fetch canonical reason/type/status from GraphQL, keyed by REST legacyResourceId.
 
@@ -166,6 +222,14 @@ def fetch_graphql_dispute_details(session, shop_domain, access_token):
             type
             status
             finalizedOn
+            order {
+              id
+              alerts {
+                title
+                content
+                severity
+              }
+            }
             reasonDetails {
               reason
               networkReasonCode
@@ -219,6 +283,20 @@ def fetch_graphql_dispute_details(session, shop_domain, access_token):
             dispute_type = str(node.get("type") or "").strip().upper()
             dispute_status = str(node.get("status") or "").strip().upper()
             finalized_on = str(node.get("finalizedOn") or "").strip()
+            order_node = node.get("order") or {}
+            order_alerts = []
+            for alert in order_node.get("alerts") or []:
+                if not isinstance(alert, dict):
+                    continue
+                title = _clean_shopify_alert_text(alert.get("title", ""))
+                content = _clean_shopify_alert_text(alert.get("content", ""))
+                severity = str(alert.get("severity") or "").strip().upper()
+                if title or content:
+                    order_alerts.append({
+                        "title": title,
+                        "content": content,
+                        "severity": severity,
+                    })
 
             if legacy_id:
                 result[legacy_id] = {
@@ -228,6 +306,8 @@ def fetch_graphql_dispute_details(session, shop_domain, access_token):
                     "status": dispute_status,
                     "finalized_on": finalized_on,
                     "dispute_gid": dispute_gid,
+                    "order_gid": str(order_node.get("id") or "").strip(),
+                    "order_alerts": order_alerts,
                 }
 
         page_info = connection.get("pageInfo") or {}
@@ -307,7 +387,7 @@ TYPE_MAP = {"CHARGEBACK": "拒付", "INQUIRY": "调单/问询"}
 STATUS_MAP = {
     "NEEDS_RESPONSE": "待回复",
     "UNDER_REVIEW": "审查中",
-    "WON": "申诉成功(胜诉)",
+    "WON": "拒付胜诉",
     "LOST": "申诉失败(败诉)",
     "ACCEPTED": "已接受(放弃申诉)",
     "CHARGE_REFUNDED": "争议款已退款",
@@ -1124,6 +1204,7 @@ def fetch_disputes_for_shop(store, token_cache):
                 dispute_item["_graphql_type"] = graphql_type
                 dispute_item["_graphql_status"] = graphql_status
                 dispute_item["_finalized_on"] = finalized_on
+                dispute_item["_order_alerts"] = canonical.get("order_alerts", [])
                 dispute_item["reason"] = graphql_reason
                 dispute_item["type"] = selected_type
                 dispute_item["status"] = selected_status
@@ -1170,6 +1251,28 @@ def fetch_disputes_for_shop(store, token_cache):
 
                 type_cn = TYPE_MAP.get(raw_type, raw_type)
                 status_cn = translate_dispute_status(raw_type, raw_status)
+                admin_alerts = d.get("_order_alerts") or []
+                admin_alert_status, admin_alert_source = select_shopify_admin_dispute_alert(
+                    raw_type, raw_status, admin_alerts
+                )
+                if admin_alert_status:
+                    status_cn = admin_alert_status
+                    increment_audit_counter("admin_alert_status_override")
+                    audit_entry = {
+                        "time_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                        "shop_name": shop_name,
+                        "shop_domain": shop_domain,
+                        "order_id": str(d.get("order_id", "")),
+                        "dispute_id": dispute_id,
+                        "graphql_type": raw_type,
+                        "graphql_status": raw_status,
+                        "selected_status": status_cn,
+                        "selected_status_source": admin_alert_source,
+                        "order_alerts": admin_alerts,
+                    }
+                    with FILE_LOCK:
+                        with open("dispute_admin_alert_status_audit.jsonl", "a", encoding="utf-8") as f:
+                            f.write(json.dumps(audit_entry, ensure_ascii=False) + "\n")
                 reason_cn = REASON_MAP.get(raw_reason, raw_reason if raw_reason else "未知原因")
                 
                 evidence_due_date = d.get("evidence_due_by", "") or "无"
@@ -1246,6 +1349,8 @@ def fetch_disputes_for_shop(store, token_cache):
                     "_graphql_type": str(d.get("_graphql_type", "") or ""),
                     "_graphql_status": str(d.get("_graphql_status", "") or ""),
                     "_finalized_on": str(d.get("_finalized_on", "") or ""),
+                    "_order_alerts": d.get("_order_alerts", []) or [],
+                    "_admin_alert_status_source": admin_alert_source,
                     "_successful_refund_transactions": successful_refund_txn_count,
                     "_evidence_due_date": evidence_due_date,
                     "_initiated_at": d.get("initiated_at", "")
